@@ -68,6 +68,30 @@ if [ -d "$pathGuiV1" ]; then
         echo "QML files are not needed."
     else
 
+        # Remove stale overlay files from other packages (e.g. GuiMods) that are
+        # incompatible with the current Venus OS version, to prevent QML load failures.
+        overlay_qml_dir="/data/apps/overlay-fs/data/gui/upper/qml"
+        if [ -d "$overlay_qml_dir" ]; then
+            stale_removed=0
+            for pkg_file in "$overlay_qml_dir"/*.package; do
+                [ -f "$pkg_file" ] || continue
+                pkg=$(cat "$pkg_file")
+                [ "$pkg" = "dbus-serialbattery" ] && continue
+                qml_file="${pkg_file%.package}"
+                rm -f "$qml_file" "${qml_file}.orig" "$pkg_file"
+                stale_removed=$((stale_removed + 1))
+            done
+            if [ $stale_removed -gt 0 ]; then
+                echo "|- Removed $stale_removed stale overlay file(s) from other packages"
+                # Remount the overlay so the kernel's directory cache reflects the removals.
+                # Without a remount, OverlayFS may continue serving deleted files from cache.
+                if mount | grep -q "on $pathGuiV1 type overlay"; then
+                    umount "$pathGuiV1" 2>/dev/null && bash /data/apps/overlay-fs/add-app-and-directory.sh dbus-serialbattery_gui "$pathGuiV1"
+                fi
+                ((filesChanged++))
+            fi
+        fi
+
         # Copy QML files for device screen
         echo "Installing QML files for GUI v1..."
 
