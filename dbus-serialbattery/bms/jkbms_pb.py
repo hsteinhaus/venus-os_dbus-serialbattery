@@ -478,6 +478,15 @@ class Jkbms_pb(Battery):
         """
         return self.unique_identifier_tmp
 
+    def custom_name(self) -> str:
+        uid = self.unique_identifier_tmp or "0x" + self.address.hex()
+        return f"SerialBattery {uid} (JKBMS PB)"
+
+    def product_name(self) -> str:
+        uid = self.unique_identifier_tmp or "0x" + self.address.hex()
+        return f"SerialBattery {uid} (JKBMS PB)"
+
+
     def get_balancing(self):
         return 1 if self.balancing else 0
 
