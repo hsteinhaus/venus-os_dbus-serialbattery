@@ -530,7 +530,11 @@ class Jkbms_pb(Battery):
             chunk = ser.read(max(1, ser.in_waiting))
             if chunk:
                 data.extend(chunk)
-                if len(data) >= length:
+                # Check if we have enough data AFTER the 0x55AA header,
+                # not total bytes. On multi-battery RS485 buses, Modbus
+                # write-ACKs prepend to the response, shifting the header.
+                hdr = data.find(b"\x55\xaa")
+                if hdr >= 0 and len(data) - hdr >= length:
                     break
             elif not data and time.monotonic() > no_data_deadline:
                 # fail-fast: no bytes at all within no_data_timeout
