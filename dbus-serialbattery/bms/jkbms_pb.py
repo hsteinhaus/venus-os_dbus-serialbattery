@@ -525,7 +525,9 @@ class Jkbms_pb(Battery):
         starting at the 0x55 0xAA header, or False on failure.
 
         Fail-fast: if no bytes arrive within no_data_timeout, bail early instead
-        of waiting for the full timeout.
+        of waiting for the full timeout.  Once data is flowing, extend the
+        deadline on each received chunk so that slow BMS responses (common on
+        buses with many batteries) are not cut short.
         """
         addr_str = "0x" + self.address.hex()
         modbus_msg = self.address + command + self.modbusCrc(self.address + command)
@@ -534,12 +536,18 @@ class Jkbms_pb(Battery):
         ser.write(modbus_msg)
 
         data = bytearray()
-        deadline = time.monotonic() + timeout
-        no_data_deadline = time.monotonic() + no_data_timeout
+        start = time.monotonic()
+        deadline = start + timeout
+        hard_deadline = start + timeout * 2
+        no_data_deadline = start + no_data_timeout
         while time.monotonic() < deadline:
             chunk = ser.read(max(1, ser.in_waiting))
             if chunk:
                 data.extend(chunk)
+                # Extend deadline while data is still flowing — BMS may
+                # pause mid-response (sensor reads).  Cap at 2× original
+                # timeout so genuine failures don't hang forever.
+                deadline = min(time.monotonic() + 0.05, hard_deadline)
                 # Check if we have enough data AFTER the 0x55AA header,
                 # not total bytes. On multi-battery RS485 buses, Modbus
                 # write-ACKs prepend to the response, shifting the header.
