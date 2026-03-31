@@ -303,12 +303,22 @@ class Jkbms_pb(Battery):
 
         try:
             with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                # Wake-up: send command_settings, wait for echo + full BMS response
-                # to arrive (~50ms processing + ~26ms wire time for 300 bytes at
-                # 115200 baud), then flush everything.
+                # Wake-up: send command_settings, then drain the full response
+                # (TX echo + ACKs + BMS reply) until the bus is quiet.
+                # Fixed sleep was insufficient on buses with many batteries.
                 ser.reset_input_buffer()
                 ser.write(wakeup_msg)
-                time.sleep(0.075)
+                time.sleep(0.05)
+                drained = 0
+                quiet_since = time.monotonic()
+                while time.monotonic() - quiet_since < 0.03:
+                    if ser.in_waiting:
+                        drained += len(ser.read(ser.in_waiting))
+                        quiet_since = time.monotonic()
+                    else:
+                        time.sleep(0.005)
+                drain_ms = (time.monotonic() - quiet_since + 0.03) * 1000
+                logger.debug(f"[{addr_str}] wakeup drain: {drained} bytes in {drain_ms:.0f}ms")
                 ser.reset_input_buffer()
 
                 # Read status; on fail, retry once (wake-up is still warm)
@@ -552,7 +562,14 @@ class Jkbms_pb(Battery):
         if offset < 0:
             logger.error(f"[{addr_str}] no 0x55AA header in {len(data)} bytes: {data[:20].hex()}")
             return False
-        return data[offset:]
+        result = data[offset:]
+        if len(result) < length:
+            logger.error(
+                f"[{addr_str}] truncated response: {len(result)}/{length} bytes" f" after 0x55AA at offset {offset}, total {len(data)} bytes: {data[:40].hex()}"
+            )
+            return False
+        logger.debug(f"[{addr_str}] response: {len(result)} bytes, header at offset {offset}, total {len(data)} bytes")
+        return result
 
     def read_serial_data_jkbms_pb(self, command: str, length: int) -> bool:
         """
