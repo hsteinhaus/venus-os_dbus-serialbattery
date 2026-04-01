@@ -34,9 +34,11 @@ class Jkbms_pb(Battery):
     try:
         WAKEUP_INITIAL_SLEEP = get_float_from_config("JKBMS_PB", "WAKEUP_INITIAL_SLEEP", 0.05)
         WAKEUP_QUIET_THRESHOLD = get_float_from_config("JKBMS_PB", "WAKEUP_QUIET_THRESHOLD", 0.03)
+        SESSION_DRAIN_SLEEP = get_float_from_config("JKBMS_PB", "SESSION_DRAIN_SLEEP", 0.02)
     except KeyError:
         WAKEUP_INITIAL_SLEEP = 0.05
         WAKEUP_QUIET_THRESHOLD = 0.03
+        SESSION_DRAIN_SLEEP = 0.02
 
     _timing_logged = False
 
@@ -97,8 +99,11 @@ class Jkbms_pb(Battery):
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
-        # Drain stale CH341 buffer bytes from previous battery's session
-        time.sleep(0.02)
+        # Drain stale CH341 buffer bytes from previous battery's session.
+        # On buses with many batteries, residual bytes from the previous
+        # battery's response may still be arriving.  Increase via config
+        # if you see "Data validation failed" on first detection attempt.
+        time.sleep(self.SESSION_DRAIN_SLEEP)
         ser.reset_input_buffer()
 
         # fw >= v15.36: BMS may not respond without a preceding command in the
@@ -574,7 +579,7 @@ class Jkbms_pb(Battery):
                 # Extend deadline while data is still flowing — BMS may
                 # pause mid-response (sensor reads).  Cap at 2× original
                 # timeout so genuine failures don't hang forever.
-                deadline = min(time.monotonic() + 0.05, hard_deadline)
+                deadline = max(deadline, min(time.monotonic() + 0.05, hard_deadline))
                 # Check if we have enough data AFTER the 0x55AA header,
                 # not total bytes. On multi-battery RS485 buses, Modbus
                 # write-ACKs prepend to the response, shifting the header.
