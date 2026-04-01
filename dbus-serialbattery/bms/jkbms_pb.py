@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import SOC_CALCULATION, get_connection_error_message, logger
+from utils import SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
 from struct import unpack_from
 import serial
 import sys
@@ -30,6 +30,33 @@ class Jkbms_pb(Battery):
     LENGTH_CHECK = 0  # ignored
     LENGTH_POS = 2  # ignored
     LENGTH_SIZE = "H"  # ignored
+
+    try:
+        WAKEUP_INITIAL_SLEEP = get_float_from_config("JKBMS_PB", "WAKEUP_INITIAL_SLEEP", 0.05)
+        WAKEUP_QUIET_THRESHOLD = get_float_from_config("JKBMS_PB", "WAKEUP_QUIET_THRESHOLD", 0.03)
+    except KeyError:
+        WAKEUP_INITIAL_SLEEP = 0.05
+        WAKEUP_QUIET_THRESHOLD = 0.03
+
+    def _wakeup_and_drain(self, ser, command):
+        """
+        Send a command as a write-only wakeup and drain the response until
+        the bus is quiet.  fw >= v15.36 requires a preceding command before
+        the actual data command will get a response.
+        """
+        msg = self.address + command + self.modbusCrc(self.address + command)
+        ser.write(msg)
+        time.sleep(self.WAKEUP_INITIAL_SLEEP)
+        drained = 0
+        quiet_since = time.monotonic()
+        while time.monotonic() - quiet_since < self.WAKEUP_QUIET_THRESHOLD:
+            if ser.in_waiting:
+                drained += len(ser.read(ser.in_waiting))
+                quiet_since = time.monotonic()
+            else:
+                time.sleep(0.005)
+        logger.debug(f"[0x{self.address.hex()}] wakeup drain: {drained} bytes")
+        ser.reset_input_buffer()
 
     def test_connection(self):
         """
@@ -72,11 +99,15 @@ class Jkbms_pb(Battery):
         time.sleep(0.02)
         ser.reset_input_buffer()
 
+        # fw >= v15.36: BMS may not respond without a preceding command in the
+        # same burst.  Send command_about as write-only wakeup, drain response,
+        # then read command_settings.
+        self._wakeup_and_drain(ser, self.command_about)
+
         status_data = self._read_response(ser, self.command_settings, 300, timeout=1.0)
         if not status_data:
             # Retry once: drain again and resend
             logger.debug(f"[{addr_str}] get_settings retry")
-            time.sleep(0.02)
             ser.reset_input_buffer()
             status_data = self._read_response(ser, self.command_settings, 300, timeout=1.0)
         if not status_data:
@@ -299,27 +330,11 @@ class Jkbms_pb(Battery):
         # both commands: send command_settings as a quick wake-up (write-only, no
         # full read), then immediately send command_status and read its response.
         addr_str = "0x" + self.address.hex()
-        wakeup_msg = self.address + self.command_settings + self.modbusCrc(self.address + self.command_settings)
 
         try:
             with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                # Wake-up: send command_settings, then drain the full response
-                # (TX echo + ACKs + BMS reply) until the bus is quiet.
-                # Fixed sleep was insufficient on buses with many batteries.
                 ser.reset_input_buffer()
-                ser.write(wakeup_msg)
-                time.sleep(0.05)
-                drained = 0
-                quiet_since = time.monotonic()
-                while time.monotonic() - quiet_since < 0.03:
-                    if ser.in_waiting:
-                        drained += len(ser.read(ser.in_waiting))
-                        quiet_since = time.monotonic()
-                    else:
-                        time.sleep(0.005)
-                drain_ms = (time.monotonic() - quiet_since + 0.03) * 1000
-                logger.debug(f"[{addr_str}] wakeup drain: {drained} bytes in {drain_ms:.0f}ms")
-                ser.reset_input_buffer()
+                self._wakeup_and_drain(ser, self.command_settings)
 
                 # Read status; on fail, retry once (wake-up is still warm)
                 status_data = self._read_response(ser, self.command_status, 299)
