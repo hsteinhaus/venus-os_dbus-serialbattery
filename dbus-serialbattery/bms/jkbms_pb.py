@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
+from utils import BATTERY_ADDRESSES, SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
 from struct import unpack_from
 import serial
 import sys
@@ -37,6 +37,8 @@ class Jkbms_pb(Battery):
     except KeyError:
         WAKEUP_INITIAL_SLEEP = 0.05
         WAKEUP_QUIET_THRESHOLD = 0.03
+
+    _timing_logged = False
 
     def _wakeup_and_drain(self, ser, command):
         """
@@ -317,6 +319,16 @@ class Jkbms_pb(Battery):
         # init the cell array
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
+
+        if not Jkbms_pb._timing_logged:
+            Jkbms_pb._timing_logged = True
+            n = max(len(BATTERY_ADDRESSES), 1)
+            per_bat_ms = (self.WAKEUP_INITIAL_SLEEP + self.WAKEUP_QUIET_THRESHOLD + 0.15) * 1000
+            logger.info(
+                f"JKBMS PB wakeup timing: sleep={self.WAKEUP_INITIAL_SLEEP * 1000:.0f}ms"
+                f" quiet={self.WAKEUP_QUIET_THRESHOLD * 1000:.0f}ms"
+                f" — estimated poll loop: {n}x {per_bat_ms:.0f}ms = {n * per_bat_ms:.0f}ms for {n} batteries"
+            )
 
         return True
 
