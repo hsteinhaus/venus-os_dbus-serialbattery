@@ -34,13 +34,29 @@ class Jkbms_pb(Battery):
     try:
         WAKEUP_INITIAL_SLEEP = get_float_from_config("JKBMS_PB", "WAKEUP_INITIAL_SLEEP", 0.05)
         WAKEUP_QUIET_THRESHOLD = get_float_from_config("JKBMS_PB", "WAKEUP_QUIET_THRESHOLD", 0.03)
-        SESSION_DRAIN_SLEEP = get_float_from_config("JKBMS_PB", "SESSION_DRAIN_SLEEP", 0.02)
     except KeyError:
         WAKEUP_INITIAL_SLEEP = 0.05
         WAKEUP_QUIET_THRESHOLD = 0.03
-        SESSION_DRAIN_SLEEP = 0.02
 
     _timing_logged = False
+    _shared_ports: dict = {}
+
+    @classmethod
+    def _get_serial(cls, port, baud):
+        ser = cls._shared_ports.get(port)
+        if ser is None or not ser.is_open:
+            ser = serial.Serial(port, baudrate=baud, timeout=0.1)
+            cls._shared_ports[port] = ser
+        return ser
+
+    @classmethod
+    def _close_serial(cls, port):
+        ser = cls._shared_ports.pop(port, None)
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
 
     def _wakeup_and_drain(self, ser, command):
         """
@@ -94,16 +110,12 @@ class Jkbms_pb(Battery):
         # Return True if success, False for failure
         addr_str = "0x" + self.address.hex()
         try:
-            ser = serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1)
+            ser = self._get_serial(self.port, self.baud_rate)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
+            self._close_serial(self.port)
             return False
 
-        # Drain stale CH341 buffer bytes from previous battery's session.
-        # On buses with many batteries, residual bytes from the previous
-        # battery's response may still be arriving.  Increase via config
-        # if you see "Data validation failed" on first detection attempt.
-        time.sleep(self.SESSION_DRAIN_SLEEP)
         ser.reset_input_buffer()
 
         # fw >= v15.36: BMS may not respond without a preceding command in the
@@ -118,7 +130,6 @@ class Jkbms_pb(Battery):
             ser.reset_input_buffer()
             status_data = self._read_response(ser, self.command_settings, 300, timeout=1.0)
         if not status_data:
-            ser.close()
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
             return False
 
@@ -249,11 +260,9 @@ class Jkbms_pb(Battery):
         logger.debug("TMPStartHeating: " + str(TMPStartHeating))
         logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
-        # Brief pause for BMS to settle before next command on half-duplex bus
-        time.sleep(0.1)
+        # command_settings already primed the bus for command_about
         ser.reset_input_buffer()
         status_data = self._read_response(ser, self.command_about, 300, timeout=1.0)
-        ser.close()
         # vendor_version start  0: 16 chars
         # hw_version     start 16:  8 chars
         # sw_version     start 24:  8 chars
@@ -349,18 +358,19 @@ class Jkbms_pb(Battery):
         addr_str = "0x" + self.address.hex()
 
         try:
-            with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                ser.reset_input_buffer()
-                self._wakeup_and_drain(ser, self.command_settings)
+            ser = self._get_serial(self.port, self.baud_rate)
+            ser.reset_input_buffer()
+            self._wakeup_and_drain(ser, self.command_settings)
 
-                # Read status; on fail, retry once (wake-up is still warm)
+            # Read status; on fail, retry once (wake-up is still warm)
+            status_data = self._read_response(ser, self.command_status, 299)
+            if not status_data:
+                logger.debug(f"[{addr_str}] status retry")
+                ser.reset_input_buffer()
                 status_data = self._read_response(ser, self.command_status, 299)
-                if not status_data:
-                    logger.debug(f"[{addr_str}] status retry")
-                    ser.reset_input_buffer()
-                    status_data = self._read_response(ser, self.command_status, 299)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
+            self._close_serial(self.port)
             return False
 
         if not status_data:
