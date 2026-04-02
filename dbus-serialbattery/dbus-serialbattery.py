@@ -330,6 +330,10 @@ def main():
 
     # show the version of the driver
     logger.info("dbus-serialbattery v" + str(DRIVER_VERSION))
+    git_commit_file = os.path.join(os.path.dirname(__file__), ".git-commit")
+    if os.path.exists(git_commit_file):
+        with open(git_commit_file) as f:
+            logger.info("git commit: " + f.read().strip()[:12])
 
     port = get_port()
     battery = {}
