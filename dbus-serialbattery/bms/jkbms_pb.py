@@ -591,6 +591,20 @@ class Jkbms_pb(Battery):
                 break
             time.sleep(0.01)
 
+        # The addressed BMS sends its Modbus write-ACK (8 bytes) AFTER the
+        # 55AA data response.  Read and validate it so it doesn't leak into
+        # the next command's read window.
+        time.sleep(0.01)
+        if ser.in_waiting:
+            ack = ser.read(ser.in_waiting)
+            expected_addr_fc = self.address + command[0:1]  # e.g. b"\x01\x10"
+            if len(ack) >= 2 and ack[1] == (command[0] | 0x80):
+                logger.warning(f"[{addr_str}] Modbus exception: code 0x{ack[2]:02x} ({ack.hex()})")
+            elif len(ack) >= 2 and ack[0:2] == expected_addr_fc:
+                logger.debug(f"[{addr_str}] write-ACK OK ({len(ack)} bytes)")
+            else:
+                logger.debug(f"[{addr_str}] unexpected trailing bytes ({len(ack)}): {ack.hex()}")
+
         if not data:
             get_connection_error_message(self.online, f"[{addr_str}] no response data")
             return False
