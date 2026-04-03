@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
+from utils import BATTERY_ADDRESSES, SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
 from struct import unpack_from
 import serial
 import sys
@@ -39,11 +39,12 @@ class Jkbms_pb(Battery):
     # 100ms: safe margin. BMS bus master uses ~180ms.
     # Configurable via [JKBMS_PB] section in config.ini.
     try:
-        COMMAND_GAP = get_float_from_config("JKBMS_PB", "COMMAND_GAP", 0.075)
+        COMMAND_GAP = get_float_from_config("JKBMS_PB", "COMMAND_GAP", 0.12)
     except KeyError:
-        COMMAND_GAP = 0.075
+        COMMAND_GAP = 0.12
 
     _last_command_time = 0.0
+    _timing_logged = False
 
     def _get_ser(self):
         """Return the shared serial port, opening it if needed."""
@@ -90,6 +91,9 @@ class Jkbms_pb(Battery):
             return False
 
         status_data = self._read_response(ser, self.command_settings, timeout=1.0)
+        if not status_data:
+            logger.warning(f"[{addr_str}] get_settings: settings retry")
+            status_data = self._read_response(ser, self.command_settings, timeout=1.0)
         if not status_data:
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
             return False
@@ -222,6 +226,9 @@ class Jkbms_pb(Battery):
         logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
         status_data = self._read_response(ser, self.command_about, timeout=1.0)
+        if not status_data:
+            logger.warning(f"[{addr_str}] get_settings: about retry")
+            status_data = self._read_response(ser, self.command_about, timeout=1.0)
         # vendor_version start  0: 16 chars
         # hw_version     start 16:  8 chars
         # sw_version     start 24:  8 chars
@@ -293,6 +300,14 @@ class Jkbms_pb(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+        if not Jkbms_pb._timing_logged:
+            Jkbms_pb._timing_logged = True
+            n = max(len(BATTERY_ADDRESSES), 1)
+            per_bat_ms = (self.COMMAND_GAP + 0.04) * 1000  # gap + ~40ms protocol
+            logger.info(
+                f"JKBMS PB timing: gap={self.COMMAND_GAP * 1000:.0f}ms" f" — estimated poll: {n}x {per_bat_ms:.0f}ms = {n * per_bat_ms:.0f}ms for {n} batteries"
+            )
+
         return True
 
     def refresh_data(self):
@@ -301,6 +316,9 @@ class Jkbms_pb(Battery):
         try:
             ser = self._get_ser()
             status_data = self._read_response(ser, self.command_status)
+            if not status_data:
+                logger.warning(f"[{addr_str}] refresh_data: retry")
+                status_data = self._read_response(ser, self.command_status)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
@@ -525,9 +543,12 @@ class Jkbms_pb(Battery):
             logger.warning(f"[{addr_str}] PRE-SEND stale={stale}: {stale_bytes.hex()}")
         ser.reset_input_buffer()
 
-        # Send command
+        # Send command and wait for TX to complete before reading.
+        # The CH341 half-duplex adapter echoes TX→RX; flush() ensures the
+        # 11-byte command is fully transmitted before the BMS responds.
         modbus_msg = self.address + command + self.modbusCrc(self.address + command)
         ser.write(modbus_msg)
+        ser.flush()
         Jkbms_pb._last_command_time = time.monotonic()
 
         # Read response bytes — log every chunk for diagnosis
@@ -554,24 +575,24 @@ class Jkbms_pb(Battery):
         elapsed_ms = round((time.monotonic() - start) * 1000, 1)
 
         if not data:
-            get_connection_error_message(self.online, f"[{addr_str}] no response (waited {elapsed_ms}ms)")
+            logger.warning(f"[{addr_str}] no response (waited {elapsed_ms}ms)")
             return False
 
         # Find 0x55AA header
         hdr = data.find(b"\x55\xaa")
         if hdr < 0:
-            logger.error(f"[{addr_str}] no 0x55AA in {len(data)} bytes after {elapsed_ms}ms" f" chunks={chunks} data={data[:40].hex()}")
+            logger.warning(f"[{addr_str}] no 0x55AA in {len(data)} bytes after {elapsed_ms}ms" f" chunks={chunks} data={data[:40].hex()}")
             return False
 
         if len(data) < hdr + PAYLOAD_SIZE:
-            logger.error(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} after {elapsed_ms}ms" f" hdr@{hdr} chunks={chunks} data={data[:40].hex()}")
+            logger.warning(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} after {elapsed_ms}ms" f" hdr@{hdr} chunks={chunks} data={data[:40].hex()}")
             return False
 
         payload = bytes(data[hdr : hdr + PAYLOAD_SIZE])
 
         # 1. Frame marker 0xEB90 at bytes 2-3
         if payload[2:4] != b"\xeb\x90":
-            logger.error(f"[{addr_str}] bad frame marker: {payload[2:4].hex()} (expected eb90)")
+            logger.warning(f"[{addr_str}] bad frame marker: {payload[2:4].hex()} (expected eb90)")
             return False
 
         # 2. Frame type matches command
@@ -583,12 +604,12 @@ class Jkbms_pb(Battery):
         ftype = payload[4] | payload[5] << 8
         expected = EXPECTED_FTYPE.get(command)
         if expected is not None and ftype != expected:
-            logger.error(f"[{addr_str}] wrong frame type: 0x{ftype:04X} (expected 0x{expected:04X})")
+            logger.warning(f"[{addr_str}] wrong frame type: 0x{ftype:04X} (expected 0x{expected:04X})")
             return False
 
         # 3. Validate checksum
         if not self._verify_checksum(payload):
-            logger.error(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
+            logger.warning(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
             return False
 
         # 4. Padding bytes must be 0x00
@@ -603,7 +624,7 @@ class Jkbms_pb(Battery):
             if not self._verify_ack(ack, command):
                 logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
         else:
-            logger.debug(f"[{addr_str}] no ACK received (payload checksum valid)")
+            logger.warning(f"[{addr_str}] no ACK received (payload checksum valid)")
 
         # 6. Trailing padding byte after ACK
         pad2_offset = ACK_OFFSET + ACK_SIZE
