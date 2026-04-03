@@ -510,7 +510,7 @@ class Jkbms_pb(Battery):
                 data.extend(ser.read(n))
                 # Check if we have a complete response
                 hdr = data.find(b"\x55\xaa")
-                if hdr >= 0 and len(data) >= hdr + PAYLOAD_SIZE + ACK_SIZE:
+                if hdr >= 0 and len(data) >= hdr + PAYLOAD_SIZE + 1 + ACK_SIZE:
                     break
             else:
                 if not data:
@@ -542,10 +542,11 @@ class Jkbms_pb(Battery):
             logger.error(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
             return False
 
-        # Validate FC16 ACK (if present)
-        ack_start = hdr + PAYLOAD_SIZE
-        if len(data) >= ack_start + ACK_SIZE:
-            ack = bytes(data[ack_start : ack_start + ACK_SIZE])
+        # Validate FC16 ACK.  The BMS sends a 0x00 padding byte between
+        # the 300-byte payload and the 8-byte FC16 ACK.
+        ACK_OFFSET = hdr + PAYLOAD_SIZE + 1
+        if len(data) >= ACK_OFFSET + ACK_SIZE:
+            ack = bytes(data[ACK_OFFSET : ACK_OFFSET + ACK_SIZE])
             if not self._verify_ack(ack, command):
                 logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
         else:
