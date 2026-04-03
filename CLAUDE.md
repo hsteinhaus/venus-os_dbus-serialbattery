@@ -69,53 +69,44 @@ tail -F /var/log/dbus-serialbattery.ttyUSB1/current | tai64nlocal
 
 ## Protocol Details (Jkbms_pb)
 
-- Modbus RTU framing; command format: `address + command_bytes + modbusCRC`
-- Response: exactly 300 bytes starting with `0x55 0xAA 0xEB 0x90` header
-- Byte 299 is sum8 checksum: `sum(bytes[0:299]) & 0xFF` (driver doesn't validate yet)
-- Frame type at offset 4-5: 0x0002=status, 0x0001=settings, 0x0003=about
-- **No battery address in the 0x55AA payload** — FC16 ACK (8 bytes, after the
-  payload) contains the correct address
-- Response header `0x55 0xAA` searched anywhere in buffer via `data.find()`
-  (CH341 TX echo or write-ACK may shift it by a few bytes)
-- See `bms-docs/JKBMS-PB.md` for full verified field map and protocol details.
+Wire protocol per command (verified by LA1010 captures, 2026-04-03):
+```
+TX: [ADDR(1)] [CMD(8)] [CRC(2)]                              = 11 bytes
+RX: [echo(0-11)] [55AA EB90 ftype(2) data(294) cksum(1)] [00] [ACK(8)] [00]
+                  \_________ payload: 300 bytes __________/     FC16 ACK
+```
+Total RX after 0x55AA header: 310 bytes (payload + pad + ACK + pad).
+
+- Sum8 checksum at byte 299: `sum(bytes[0:299]) & 0xFF`
+- Frame type at bytes 4-5: 0x0002=status, 0x0001=settings, 0x0003=about
+- No battery address in the 0x55AA payload; the FC16 ACK contains it
+- See `bms-docs/JKBMS-PB.md` for full verified field map
 
 ## Serial Communication Architecture
 
-- **Wakeup-and-drain is OBSOLETE** (2026-04-03): LA1010 captures proved the
-  JKBMS Monitor software gets clean addressed responses with single FC16
-  commands at ~800ms intervals, using the same CH341 adapter, no wakeup
-  burst needed. The wakeup-and-drain rapid command bursts were the ROOT
-  CAUSE of the cross-talk, not a fix for it. Should be removed.
-- `_read_response(ser, command, length, timeout, no_data_timeout)`: core method,
-  sends command on already-open port, custom read loop with fail-fast (bail after
-  `no_data_timeout` if zero bytes received, default 250ms). Extends deadline by
-  50ms on each received chunk (capped at 2× timeout) to handle BMS mid-response
-  pauses. Returns False on truncated data instead of passing partial buffer.
-- `read_serial_data_jkbms_pb()`: opens fresh port, delegates to `_read_response()`.
-  Only used by `test_connection()` fallback path.
-- EMA low-pass filter (alpha=0.3) on cell voltages suppresses 1mV ADC jitter,
-  reducing actual dbus writes from ~100 to ~3-10 per battery per cycle.
+- Shared serial port kept open across all battery instances (`_shared_ser`)
+- `_read_response(ser, command, timeout)`: sends FC16 command, reads all
+  310 bytes after 0x55AA, validates checksum + frame marker + frame type +
+  padding bytes + ACK (address, register, CRC) + total byte count
+- `COMMAND_GAP` (default 0.1s, configurable via `[JKBMS_PB]` in config.ini):
+  minimum gap between consecutive RS485 commands
+- EMA low-pass filter (alpha=0.3) on cell voltages suppresses 1mV ADC jitter
+- **Critical**: the read loop must consume ALL 310 bytes after the 0x55AA
+  header. Breaking early (e.g., after 300 bytes) leaves the ACK + padding
+  in the CH341 FIFO, which corrupts the next command's response.
 
 ## D-Bus Performance
 
 - `_CachedDbusProxy` in `dbushelper.py` suppresses writes when value unchanged.
 - `last_refresh_duration` tracked per battery in `dbushelper.py`; poll interval
   auto-increase uses refresh time only (not total runtime including dbus).
-- dbus-python/GLib reentrancy: incoming GetValue requests pile up during serial
-  reads and get processed in bursts when publish_dbus touches dbus objects.
-  Causes occasional 1-2s stalls. Attempted fixes (deferred signals, ctx.iteration,
-  threaded writers) all failed due to GLib single-threaded reentrancy.
-  Current mitigation: decouple poll interval from dbus overhead.
-- See `JKBMS-PB.md` for full analysis.
 
-## Tested Stability (2026-04-01)
+## Tested Stability (2026-04-03, deterministic driver)
 
-- 10/10 restarts: 0 errors, 0 warnings, all 4 batteries first try
-- 1-hour endurance: 0 errors, 0 warnings, stable 1s poll interval
-- Per-battery timing: ~150ms serial, ~3ms calc, ~20ms dbus (typical)
-- External tester (Off-Grid-Garage): 9 batteries (V14/V15/V19 mix) stable
-  with default timing (50ms+30ms). Occasional truncated responses on 0x08
-  handled by soft deadline extension + truncation guard.
+- 4/4 batteries detected first try, zero errors, zero warnings
+- All responses validated: checksum, frame marker, frame type, ACK CRC
+- Zero stale bytes between commands (all 310 RX bytes consumed)
+- Verified by LA1010: zero cross-talk, all ACKs from correct addresses
 
 ## Upstream / PR Workflow
 

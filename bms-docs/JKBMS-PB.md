@@ -80,17 +80,25 @@ Total: 11 bytes.  The 8-byte command body is a Modbus FC 0x10 write
 
 **Response** (proprietary):
 
-    [ TX echo (0-5) ] [ 0x55 0xAA 0xEB 0x90 ] [ frame_type (2) ] [ payload ]
+    [ TX echo (0-11) ] [ payload (300) ] [ 0x00 ] [ FC16 ACK (8) ] [ 0x00 ]
 
-- `0x55 0xAA` header must be found by scanning (variable offset due to
-  TX echo and Modbus write-ACK bytes)
-- `0xEB 0x90` follows the magic header in all observed responses
-- Payload is **little-endian** (unlike standard Modbus which is big-endian)
-- Frame is exactly **300 bytes** (offsets 0–299 from `0x55 0xAA`).
-  Byte 299 is a checksum: `sum(bytes[0:299]) & 0xFF`.  Verified on
-  all 4 batteries (3 slaves + master), both status and settings
-  responses, across multiple cycles.  Bytes after 299 are noise or
-  next-command bleed from the bus.
+The complete wire sequence after the 0x55AA header is **310 bytes**:
+- Payload: 300 bytes starting with `55 AA EB 90`, little-endian data
+- Padding: 1 byte, always `0x00`
+- FC16 ACK: 8 bytes, standard Modbus with valid CRC
+- Trailing: 1 byte, always `0x00`
+
+The `0x55 0xAA` header is found by scanning (variable offset 0–11 due
+to CH341 TX echo).  `0xEB 0x90` at bytes 2–3 is a constant frame
+marker present in all responses.
+
+Byte 299 is a checksum: `sum(bytes[0:299]) & 0xFF`.  Verified on
+all 4 batteries (3 slaves + master), both status and settings
+responses, across multiple cycles.
+
+**Critical:** All 310 bytes after the header must be consumed by the
+reader.  Leaving the ACK + padding bytes unread causes them to appear
+as stale data before the next command, corrupting that response.
 
 **Offset 4–5** is a frame type identifier, NOT the responding battery
 address (all batteries return the same value: 0x0002 for status, 0x0001
@@ -107,9 +115,9 @@ byte in the response that identifies which battery sent it.
   2026-04-03, only the addressed battery responds, zero cross-talk
 
 Cross-talk was observed in earlier driver tests (2026-04-02) using the
-same CH341 adapter, but this was likely caused by the test methodology
-(e.g., rapid command bursts from wakeup-and-drain), not by Protocol B
-itself.  See "Bus Behaviour" section for details.
+same CH341 adapter, but was caused by the test methodology (rapid
+command bursts), not by Protocol B itself.  See "Bus Behaviour"
+section for details.
 
 **JKBMS Monitor software init sequence** (captured 2026-04-03):
 1. About (0x161C) × 2, then Settings (0x161E) × 2, ~160ms apart
@@ -133,7 +141,7 @@ same trigger commands as Protocol B, but with correct address filtering.
 **Request→Response sequence** for each active battery:
 
     Master TX:  [ ADDR ] [ 10 16 20 00 01 02 00 00 ] [ CRC ]   (11 bytes)
-    Slave TX:   [ 0x55 0xAA 0xEB 0x90 ... ]                     (300 bytes, proprietary)
+    Slave TX:   [ payload(300) ] [ 0x00 ] [ ACK(8) ] [ 0x00 ]   (310 bytes total)
     Slave TX:   [ ADDR ] [ 10 16 20 00 01 ] [ CRC ]             (8 bytes, FC16 ACK)
 
 The slave transmits the proprietary 0x55AA payload first, then the
@@ -171,8 +179,7 @@ as 0x55AA frames.  These appear once per cycle.
 continuously, even during scan windows where no battery responds.
 Decoding at alternative baud rates (9600–460800) yields zero valid
 frames — the continuous signal is not UART data at any standard rate.
-The master's RS485 driver appears to remain enabled (not tri-stated),
-producing garbled UART bytes between valid frames.
+The source of this continuous bus activity is unknown.
 
 ## Official Register Map (from JKBMS RS485 Modbus V1.0/V1.1)
 
@@ -493,7 +500,8 @@ Higher offsets (derived from official register map, offset = register + 6):
 ### About (trigger 0x161C) — driver offsets
 
 Not used by Protocol C (bus master).  Observed in JKBMS Monitor init
-sequence (2026-04-03): ftype=0x0003, 300 bytes, checksum at byte 299.
+sequence (2026-04-03): ftype=0x0003, 300-byte payload (310 bytes total
+on wire including padding + ACK), checksum at byte 299.
 Device ID and firmware version confirmed readable.  Field offsets below
 are from the driver source.
 
@@ -514,8 +522,9 @@ are from the driver source.
 ### Address Filtering and Cross-Talk
 
 **Summary:** Address filtering works correctly in all controlled tests.
-Cross-talk observed in early driver tests (2026-04-02) was likely an
-artifact of the test methodology, not a Protocol B limitation.
+Cross-talk observed in early driver tests (2026-04-02) was an artifact
+of the test methodology (rapid command bursts), not a Protocol B
+limitation.  Confirmed by JKBMS Monitor test with the same adapter.
 
 **Protocol A (FC 0x03):** No cross-talk.  Standard Modbus address
 filtering.  Tested 2026-04-02, external host, CH341 adapter.
@@ -537,32 +546,22 @@ units appeared to respond to every FC 0x10 trigger regardless of the
 address byte.  This was originally attributed to Protocol B lacking
 address filtering.  However, the JKBMS Monitor test (2026-04-03) using
 the **identical adapter hardware** shows correct address filtering.
-The cross-talk was therefore caused by the test software, not by the
-protocol or the adapter.  Likely cause: the driver's wakeup-and-drain
-pattern sends rapid command bursts (wakeup command + data command
-within ~50ms), which may trigger responses from multiple batteries.
-Single commands at ~800ms intervals (as sent by the JKBMS Monitor)
-produce clean, addressed responses.
+The cross-talk was caused by the test software sending rapid command
+bursts (two commands within ~50ms), not by the protocol or adapter.
+Single commands with ≥100ms gap produce clean, addressed responses.
 
 The bus is completely silent during passive listening when no master
 is present (verified: 5 rounds × 5 seconds = zero bytes, 2026-04-02).
 
 ### Why the Driver Uses Protocol B
 
-The proprietary protocol was likely the original BMS interface, predating
-the official Modbus spec. The driver was written against this interface.
-Address filtering works correctly when single commands are sent at
-reasonable intervals (~800ms as per JKBMS Monitor).
+Address filtering works correctly when single
+commands are sent at reasonable intervals (≥100ms gap between commands).
 
-The driver currently uses a "wakeup-and-drain" pattern that sends rapid
-command bursts.  This was the root cause of the cross-talk observed in
-earlier tests — it should be removed.
-
-Note: the 0x55AA payload does NOT contain the responding BMS's address
-(offset 4–5 is a frame type, not an address; no address field exists
-anywhere in the payload).  The FC16 ACK (which follows the 0x55AA
-payload) does contain the correct battery address and should be used
-for responder verification.
+The 0x55AA payload does NOT contain the responding BMS's address
+(offset 4–5 is a frame type, not an address).  The FC16 ACK (which
+follows the payload) does contain the correct battery address and is
+used for responder verification by the driver.
 
 ### Migration Path to Protocol A
 
@@ -594,17 +593,16 @@ result = crc as 2 bytes, little-endian
 Verified by recomputing CRC for all 54 captured Modbus frames (10s
 capture, 2026-04-03) — all match.
 
-Note: In early external-host tests (2026-04-02), Protocol B appeared
-not to verify the Modbus CRC on requests (BMS responded to corrupted
-CRC).  However, those tests used rapid command bursts which may have
-confounded the results — it is unclear whether the response was to the
-corrupted command or to a preceding valid one.  Protocol A does verify
-CRC.  Protocol C uses valid CRC in both directions.
+Protocol A verifies CRC.  Protocol C uses valid CRC in both directions.
+Protocol B CRC verification was not independently tested with single
+commands (earlier tests used rapid command bursts that confounded
+results).
 
 ### 8-bit checksum (0x55AA proprietary responses)
 
-The 0x55AA proprietary response frame is exactly 300 bytes (offsets
-0–299).  Byte 299 is a simple 8-bit checksum:
+The 0x55AA proprietary payload is 300 bytes (offsets 0–299).  The full
+wire response is 310 bytes: payload(300) + 0x00(1) + FC16 ACK(8) +
+0x00(1).  Byte 299 of the payload is a simple 8-bit checksum:
 
 ```
 checksum = sum(bytes[0:299]) & 0xFF
@@ -635,13 +633,9 @@ Neither issue applies to Protocol C (BMS-to-BMS, no external adapter).
 
 | Phase              | Duration   | Notes |
 |--------------------|------------|-------|
-| Port open + settle | 15–50ms    | skip if port kept open |
-| Command + response | 35–50ms    | 300 bytes at 115200 baud |
-| Post-read drain    | 10–50ms    | write-ACK + cross-talk |
-| **Total per battery** | **~50–100ms** | with shared port |
-
-The driver's wakeup-and-drain pattern adds ~80–100ms per battery but
-is unnecessary — single commands work without it (see Bus Behaviour).
+| Command + response | 35–50ms    | 310 bytes at 115200 baud |
+| Command gap        | 100ms      | configurable, minimum for CH341 reliability |
+| **Total per command** | **~150ms** | with shared port, single command |
 
 ### Protocol C — bus master, 3 active + 12 scanned
 
@@ -669,18 +663,6 @@ publishes ~100 properties per cycle. Mitigations:
 
 2. **Poll interval decoupling**: auto-increase logic uses serial+calc
    time only, excluding D-Bus overhead.
-
-### GLib Reentrancy Problem (unresolved)
-
-The driver runs a single-threaded GLib main loop handling both outgoing
-property updates and incoming `GetValue`/`GetText` requests. During
-serial I/O, requests queue up and get processed reentrantly when
-`publish_dbus()` touches D-Bus objects, causing occasional 1–2s stalls.
-
-Current workaround: decoupled poll interval prevents stalls from
-affecting data rate. A full fix requires replacing dbus-python with an
-async D-Bus library or separating serial and D-Bus into different
-processes.
 
 ## Reference Documents
 
