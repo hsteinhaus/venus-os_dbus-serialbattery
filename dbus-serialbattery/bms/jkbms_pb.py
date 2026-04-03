@@ -34,13 +34,14 @@ class Jkbms_pb(Battery):
     _shared_ser = None  # shared serial port, kept open across calls
 
     # Minimum gap between consecutive commands on the RS485 bus (seconds).
-    # The BMS bus master uses ~180ms; the JKBMS Monitor uses ~800ms.
-    # Too short causes the CH341 adapter to pick up stale bytes from the
-    # previous response.  Configurable via [JKBMS_PB] section in config.ini.
+    # 50ms: stale bytes from CH341 USB FIFO latency.
+    # 75ms: zero errors on 4-battery system.
+    # 100ms: safe margin. BMS bus master uses ~180ms.
+    # Configurable via [JKBMS_PB] section in config.ini.
     try:
-        COMMAND_GAP = get_float_from_config("JKBMS_PB", "COMMAND_GAP", 0.1)
+        COMMAND_GAP = get_float_from_config("JKBMS_PB", "COMMAND_GAP", 0.075)
     except KeyError:
-        COMMAND_GAP = 0.1
+        COMMAND_GAP = 0.075
 
     _last_command_time = 0.0
 
