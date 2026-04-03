@@ -57,6 +57,7 @@ def _make_bms(addr=0x03):
     bms.command_status = b"\x10\x16\x20\x00\x01\x02\x00\x00"
     bms.command_settings = b"\x10\x16\x1e\x00\x01\x02\x00\x00"
     bms.command_about = b"\x10\x16\x1c\x00\x01\x02\x00\x00"
+    bms.online = True
     return bms
 
 
@@ -127,3 +128,95 @@ class TestAckValidation:
         exc = bytes([0x03, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
         bms = _make_bms(addr=0x03)
         assert bms._verify_ack(exc, bms.command_status) is False
+
+
+class MockSerial:
+    """Simulates a serial port returning pre-loaded data."""
+
+    def __init__(self, response_bytes):
+        self._buf = bytearray(response_bytes)
+        self._written = bytearray()
+
+    def write(self, data):
+        self._written.extend(data)
+
+    def read(self, size):
+        chunk = bytes(self._buf[:size])
+        self._buf = self._buf[size:]
+        return chunk
+
+    @property
+    def in_waiting(self):
+        return len(self._buf)
+
+    def reset_input_buffer(self):
+        pass
+
+
+class TestReadResponse:
+    def test_clean_response(self):
+        """300-byte payload + 8-byte ACK, no prefix."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(STATUS_RESPONSE + FC16_ACK)
+        result = bms._read_response(ser, bms.command_status, timeout=0.5)
+        assert result is not False
+        assert len(result) == 300
+        assert result[:4] == b"\x55\xaa\xeb\x90"
+
+    def test_tx_echo_prefix(self):
+        """CH341 TX echo (11 bytes) prepended before 0x55AA."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(FC16_REQUEST_STATUS + STATUS_RESPONSE + FC16_ACK)
+        result = bms._read_response(ser, bms.command_status, timeout=0.5)
+        assert result is not False
+        assert len(result) == 300
+        assert result[:4] == b"\x55\xaa\xeb\x90"
+
+    def test_checksum_failure_returns_false(self):
+        """Corrupted payload must return False."""
+        bms = _make_bms(addr=0x03)
+        bad = bytearray(STATUS_RESPONSE)
+        bad[100] ^= 0xFF
+        ser = MockSerial(bytes(bad) + FC16_ACK)
+        result = bms._read_response(ser, bms.command_status, timeout=0.5)
+        assert result is False
+
+    def test_no_data_returns_false(self):
+        """Empty bus — no response at all."""
+        bms = _make_bms(addr=0x03)
+        bms.online = True
+        ser = MockSerial(b"")
+        result = bms._read_response(ser, bms.command_status, timeout=0.1)
+        assert result is False
+
+    def test_no_header_returns_false(self):
+        """Data arrives but no 0x55AA."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(b"\xff" * 400)
+        result = bms._read_response(ser, bms.command_status, timeout=0.1)
+        assert result is False
+
+    def test_command_written_correctly(self):
+        """Verify FC16 command bytes sent to serial."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(STATUS_RESPONSE + FC16_ACK)
+        bms._read_response(ser, bms.command_status, timeout=0.5)
+        assert ser._written == FC16_REQUEST_STATUS
+
+    def test_missing_ack_still_returns_payload(self):
+        """If ACK is missing, still return payload (checksum validates it)."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(STATUS_RESPONSE)  # no ACK
+        result = bms._read_response(ser, bms.command_status, timeout=0.5)
+        # Payload is valid (checksum OK), ACK absence is a warning not failure
+        assert result is not False
+        assert len(result) == 300
+
+    def test_settings_response(self):
+        """Settings command returns settings payload."""
+        bms = _make_bms(addr=0x03)
+        ser = MockSerial(SETTINGS_RESPONSE + FC16_ACK_SETTINGS)
+        result = bms._read_response(ser, bms.command_settings, timeout=0.5)
+        assert result is not False
+        assert len(result) == 300
+        assert result[4] | result[5] << 8 == 1  # ftype=1 = settings
