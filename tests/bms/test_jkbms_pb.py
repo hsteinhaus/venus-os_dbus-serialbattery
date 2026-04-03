@@ -131,14 +131,20 @@ class TestAckValidation:
 
 
 class MockSerial:
-    """Simulates a serial port returning pre-loaded data."""
+    """Simulates a serial port returning pre-loaded data.
+
+    Data becomes available only after write() is called, simulating
+    the real protocol: command TX triggers BMS response RX.
+    """
 
     def __init__(self, response_bytes):
-        self._buf = bytearray(response_bytes)
+        self._response = bytearray(response_bytes)
+        self._buf = bytearray()  # empty until write triggers response
         self._written = bytearray()
 
     def write(self, data):
         self._written.extend(data)
+        self._buf.extend(self._response)  # BMS "responds" after command
 
     def read(self, size):
         chunk = bytes(self._buf[:size])
@@ -150,7 +156,7 @@ class MockSerial:
         return len(self._buf)
 
     def reset_input_buffer(self):
-        pass
+        self._buf.clear()
 
 
 class TestReadResponse:
