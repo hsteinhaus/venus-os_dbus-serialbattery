@@ -38,11 +38,9 @@ class Jkbms_pb(Battery):
         Return True if success, False for failure
         """
         result = False
+        t0 = time.monotonic()
         try:
-            # get settings to check if the data is valid and the connection is working
             result = self.get_settings()
-            # get the rest of the data to be sure, that all data is valid and the correct battery type is recognized
-            # only read next data if the first one was successful, this saves time when checking multiple battery types
             result = result and self.refresh_data()
         except Exception:
             (
@@ -55,6 +53,9 @@ class Jkbms_pb(Battery):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             result = False
 
+        addr_str = "0x" + self.address.hex()
+        dt_ms = (time.monotonic() - t0) * 1000
+        logger.info(f"[{addr_str}] test_connection: {'OK' if result else 'FAILED'} in {dt_ms:.0f}ms")
         return result
 
     def get_settings(self):
@@ -278,6 +279,7 @@ class Jkbms_pb(Battery):
 
     def refresh_data(self):
         addr_str = "0x" + self.address.hex()
+        t0 = time.monotonic()
         try:
             with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
                 status_data = self._read_response(ser, self.command_status)
@@ -289,7 +291,10 @@ class Jkbms_pb(Battery):
             logger.warning(f"[{addr_str}] refresh_data: no response")
             return False
 
-        return self.read_status_data(status_data)
+        result = self.read_status_data(status_data)
+        dt_ms = (time.monotonic() - t0) * 1000
+        logger.debug(f"[{addr_str}] refresh_data: {dt_ms:.0f}ms")
+        return result
 
     def read_status_data(self, status_data):
         # check if connection success
