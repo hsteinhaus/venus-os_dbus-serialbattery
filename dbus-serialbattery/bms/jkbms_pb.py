@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import BATTERY_ADDRESSES, SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
+from utils import SOC_CALCULATION, get_connection_error_message, logger
 from struct import unpack_from
 import serial
 import sys
@@ -30,37 +30,6 @@ class Jkbms_pb(Battery):
     LENGTH_CHECK = 0  # ignored
     LENGTH_POS = 2  # ignored
     LENGTH_SIZE = "H"  # ignored
-
-    try:
-        WAKEUP_INITIAL_SLEEP = get_float_from_config("JKBMS_PB", "WAKEUP_INITIAL_SLEEP", 0.05)
-        WAKEUP_QUIET_THRESHOLD = get_float_from_config("JKBMS_PB", "WAKEUP_QUIET_THRESHOLD", 0.03)
-        SESSION_DRAIN_SLEEP = get_float_from_config("JKBMS_PB", "SESSION_DRAIN_SLEEP", 0.02)
-    except KeyError:
-        WAKEUP_INITIAL_SLEEP = 0.05
-        WAKEUP_QUIET_THRESHOLD = 0.03
-        SESSION_DRAIN_SLEEP = 0.02
-
-    _timing_logged = False
-
-    def _wakeup_and_drain(self, ser, command):
-        """
-        Send a command as a write-only wakeup and drain the response until
-        the bus is quiet.  fw >= v15.36 requires a preceding command before
-        the actual data command will get a response.
-        """
-        msg = self.address + command + self.modbusCrc(self.address + command)
-        ser.write(msg)
-        time.sleep(self.WAKEUP_INITIAL_SLEEP)
-        drained = 0
-        quiet_since = time.monotonic()
-        while time.monotonic() - quiet_since < self.WAKEUP_QUIET_THRESHOLD:
-            if ser.in_waiting:
-                drained += len(ser.read(ser.in_waiting))
-                quiet_since = time.monotonic()
-            else:
-                time.sleep(0.005)
-        logger.debug(f"[0x{self.address.hex()}] wakeup drain: {drained} bytes")
-        ser.reset_input_buffer()
 
     def test_connection(self):
         """
@@ -99,24 +68,7 @@ class Jkbms_pb(Battery):
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
-        # Drain stale CH341 buffer bytes from previous battery's session.
-        # On buses with many batteries, residual bytes from the previous
-        # battery's response may still be arriving.  Increase via config
-        # if you see "Data validation failed" on first detection attempt.
-        time.sleep(self.SESSION_DRAIN_SLEEP)
-        ser.reset_input_buffer()
-
-        # fw >= v15.36: BMS may not respond without a preceding command in the
-        # same burst.  Send command_about as write-only wakeup, drain response,
-        # then read command_settings.
-        self._wakeup_and_drain(ser, self.command_about)
-
         status_data = self._read_response(ser, self.command_settings, timeout=1.0)
-        if not status_data:
-            # Retry once: drain again and resend
-            logger.debug(f"[{addr_str}] get_settings retry")
-            ser.reset_input_buffer()
-            status_data = self._read_response(ser, self.command_settings, timeout=1.0)
         if not status_data:
             ser.close()
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
@@ -249,9 +201,6 @@ class Jkbms_pb(Battery):
         logger.debug("TMPStartHeating: " + str(TMPStartHeating))
         logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
-        # Brief pause for BMS to settle before next command on half-duplex bus
-        time.sleep(0.1)
-        ser.reset_input_buffer()
         status_data = self._read_response(ser, self.command_about, timeout=1.0)
         ser.close()
         # vendor_version start  0: 16 chars
@@ -325,53 +274,24 @@ class Jkbms_pb(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
-        if not Jkbms_pb._timing_logged:
-            Jkbms_pb._timing_logged = True
-            n = max(len(BATTERY_ADDRESSES), 1)
-            per_bat_ms = (self.WAKEUP_INITIAL_SLEEP + self.WAKEUP_QUIET_THRESHOLD + 0.15) * 1000
-            logger.info(
-                f"JKBMS PB wakeup timing: sleep={self.WAKEUP_INITIAL_SLEEP * 1000:.0f}ms"
-                f" quiet={self.WAKEUP_QUIET_THRESHOLD * 1000:.0f}ms"
-                f" — estimated poll loop: {n}x {per_bat_ms:.0f}ms = {n * per_bat_ms:.0f}ms for {n} batteries"
-            )
-
         return True
 
     def refresh_data(self):
-        # call all functions that will refresh the battery data.
-        # This will be called for every iteration (1 second)
-        # Return True if success, False for failure
-        #
-        # fw >= v15.36: command_status only responds when preceded by another command
-        # in the same rapid burst (< ~200ms gap). We open the serial port once for
-        # both commands: send command_settings as a quick wake-up (write-only, no
-        # full read), then immediately send command_status and read its response.
         addr_str = "0x" + self.address.hex()
-
         try:
             with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                ser.reset_input_buffer()
-                self._wakeup_and_drain(ser, self.command_settings)
-
-                # Read status; on fail, retry once (wake-up is still warm)
                 status_data = self._read_response(ser, self.command_status)
-                if not status_data:
-                    logger.debug(f"[{addr_str}] status retry")
-                    ser.reset_input_buffer()
-                    status_data = self._read_response(ser, self.command_status)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
         if not status_data:
-            logger.warning(f"refresh_data: command_status failed for addr {addr_str}")
+            logger.warning(f"[{addr_str}] refresh_data: no response")
             return False
 
         return self.read_status_data(status_data)
 
-    def read_status_data(self, status_data=None):
-        if status_data is None:
-            status_data = self.read_serial_data_jkbms_pb(self.command_status)
+    def read_status_data(self, status_data):
         # check if connection success
         if not status_data:
             logger.warning("read_status_data: command_status failed for addr 0x" + self.address.hex())
@@ -627,22 +547,6 @@ class Jkbms_pb(Battery):
             logger.debug(f"[{addr_str}] no ACK received (payload checksum valid)")
 
         return payload
-
-    def read_serial_data_jkbms_pb(self, command: str) -> bool:
-        """
-        Send a command and read the response from the BMS.
-        Opens a fresh serial port; for callers that already have an open port,
-        use _read_response() directly.
-        :param command: the command to be sent to the bms
-        :return: data bytearray starting at 0x55 0xAA header if successful, False otherwise
-        """
-        addr_str = "0x" + self.address.hex()
-        try:
-            with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                return self._read_response(ser, command)
-        except serial.SerialException as e:
-            logger.error(f"[{addr_str}] serial error: {e}")
-            return False
 
     @staticmethod
     def _verify_checksum(data):
