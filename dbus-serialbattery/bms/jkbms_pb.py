@@ -111,12 +111,12 @@ class Jkbms_pb(Battery):
         # then read command_settings.
         self._wakeup_and_drain(ser, self.command_about)
 
-        status_data = self._read_response(ser, self.command_settings, 300, timeout=1.0)
+        status_data = self._read_response(ser, self.command_settings, timeout=1.0)
         if not status_data:
             # Retry once: drain again and resend
             logger.debug(f"[{addr_str}] get_settings retry")
             ser.reset_input_buffer()
-            status_data = self._read_response(ser, self.command_settings, 300, timeout=1.0)
+            status_data = self._read_response(ser, self.command_settings, timeout=1.0)
         if not status_data:
             ser.close()
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
@@ -252,7 +252,7 @@ class Jkbms_pb(Battery):
         # Brief pause for BMS to settle before next command on half-duplex bus
         time.sleep(0.1)
         ser.reset_input_buffer()
-        status_data = self._read_response(ser, self.command_about, 300, timeout=1.0)
+        status_data = self._read_response(ser, self.command_about, timeout=1.0)
         ser.close()
         # vendor_version start  0: 16 chars
         # hw_version     start 16:  8 chars
@@ -354,11 +354,11 @@ class Jkbms_pb(Battery):
                 self._wakeup_and_drain(ser, self.command_settings)
 
                 # Read status; on fail, retry once (wake-up is still warm)
-                status_data = self._read_response(ser, self.command_status, 299)
+                status_data = self._read_response(ser, self.command_status)
                 if not status_data:
                     logger.debug(f"[{addr_str}] status retry")
                     ser.reset_input_buffer()
-                    status_data = self._read_response(ser, self.command_status, 299)
+                    status_data = self._read_response(ser, self.command_status)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
@@ -371,7 +371,7 @@ class Jkbms_pb(Battery):
 
     def read_status_data(self, status_data=None):
         if status_data is None:
-            status_data = self.read_serial_data_jkbms_pb(self.command_status, 299)
+            status_data = self.read_serial_data_jkbms_pb(self.command_status)
         # check if connection success
         if not status_data:
             logger.warning("read_status_data: command_status failed for addr 0x" + self.address.hex())
@@ -559,81 +559,76 @@ class Jkbms_pb(Battery):
         self.protection.high_temperature = 2 if (byte_data & 0x00008000) else 0
         self.protection.low_temperature = 0
 
-    def _read_response(self, ser, command, length, timeout=0.5, no_data_timeout=0.25):
+    def _read_response(self, ser, command, timeout=0.5):
         """
-        Send a command on an already-open serial port and return the response
-        starting at the 0x55 0xAA header, or False on failure.
+        Send an FC16 command and read the deterministic response.
 
-        Fail-fast: if no bytes arrive within no_data_timeout, bail early instead
-        of waiting for the full timeout.  Once data is flowing, extend the
-        deadline on each received chunk so that slow BMS responses (common on
-        buses with many batteries) are not cut short.
+        Protocol: TX 11 bytes -> RX [echo(0-11)] [payload(300)] [ACK(8)]
+        Returns 300-byte payload from 0x55AA, or False on failure.
         """
+        PAYLOAD_SIZE = 300
+        ACK_SIZE = 8
         addr_str = "0x" + self.address.hex()
-        modbus_msg = self.address + command + self.modbusCrc(self.address + command)
 
+        # Send command
+        modbus_msg = self.address + command + self.modbusCrc(self.address + command)
         ser.reset_input_buffer()
         ser.write(modbus_msg)
 
+        # Read response bytes
         data = bytearray()
         start = time.monotonic()
         deadline = start + timeout
-        hard_deadline = start + timeout * 2
-        no_data_deadline = start + no_data_timeout
         while time.monotonic() < deadline:
-            chunk = ser.read(max(1, ser.in_waiting))
-            if chunk:
-                data.extend(chunk)
-                # Extend deadline while data is still flowing — BMS may
-                # pause mid-response (sensor reads).  Cap at 2× original
-                # timeout so genuine failures don't hang forever.
-                deadline = max(deadline, min(time.monotonic() + 0.05, hard_deadline))
-                # Check if we have enough data AFTER the 0x55AA header,
-                # not total bytes. On multi-battery RS485 buses, Modbus
-                # write-ACKs prepend to the response, shifting the header.
+            n = ser.in_waiting
+            if n > 0:
+                data.extend(ser.read(n))
+                # Check if we have a complete response
                 hdr = data.find(b"\x55\xaa")
-                if hdr >= 0 and len(data) - hdr >= length:
+                if hdr >= 0 and len(data) >= hdr + PAYLOAD_SIZE + ACK_SIZE:
                     break
-            elif not data and time.monotonic() > no_data_deadline:
-                # fail-fast: no bytes at all within no_data_timeout
-                break
-            time.sleep(0.01)
-
-        # The addressed BMS sends its Modbus write-ACK (8 bytes) AFTER the
-        # 55AA data response.  Read and validate it so it doesn't leak into
-        # the next command's read window.
-        time.sleep(0.01)
-        if ser.in_waiting:
-            ack = ser.read(ser.in_waiting)
-            expected_addr_fc = self.address + command[0:1]  # e.g. b"\x01\x10"
-            if len(ack) >= 2 and ack[1] == (command[0] | 0x80):
-                logger.warning(f"[{addr_str}] Modbus exception: code 0x{ack[2]:02x} ({ack.hex()})")
-            elif len(ack) >= 2 and ack[0:2] == expected_addr_fc:
-                logger.debug(f"[{addr_str}] write-ACK OK ({len(ack)} bytes)")
             else:
-                logger.debug(f"[{addr_str}] unexpected trailing bytes ({len(ack)}): {ack.hex()}")
+                if not data:
+                    time.sleep(0.01)  # waiting for first byte
+                else:
+                    # Data started but paused — brief wait for ACK
+                    time.sleep(0.005)
+                    if ser.in_waiting == 0:
+                        break  # no more data coming
 
         if not data:
-            get_connection_error_message(self.online, f"[{addr_str}] no response data")
+            get_connection_error_message(self.online, f"[{addr_str}] no response")
             return False
 
-        # When multiple batteries share the RS485 bus the Modbus 0x10 write-ACK
-        # (8 bytes) may be prepended to the BMS response, shifting the 0x55 0xAA
-        # header by a few bytes.  Scan for it rather than assuming offset 0.
-        offset = data.find(b"\x55\xaa")
-        if offset < 0:
+        # Find 0x55AA header
+        hdr = data.find(b"\x55\xaa")
+        if hdr < 0:
             logger.error(f"[{addr_str}] no 0x55AA header in {len(data)} bytes: {data[:20].hex()}")
             return False
-        result = data[offset:]
-        if len(result) < length:
-            logger.error(
-                f"[{addr_str}] truncated response: {len(result)}/{length} bytes" f" after 0x55AA at offset {offset}, total {len(data)} bytes: {data[:40].hex()}"
-            )
-            return False
-        logger.debug(f"[{addr_str}] response: {len(result)} bytes, header at offset {offset}, total {len(data)} bytes")
-        return result
 
-    def read_serial_data_jkbms_pb(self, command: str, length: int) -> bool:
+        if len(data) < hdr + PAYLOAD_SIZE:
+            logger.error(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} bytes after 0x55AA")
+            return False
+
+        payload = bytes(data[hdr : hdr + PAYLOAD_SIZE])
+
+        # Validate checksum
+        if not self._verify_checksum(payload):
+            logger.error(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
+            return False
+
+        # Validate FC16 ACK (if present)
+        ack_start = hdr + PAYLOAD_SIZE
+        if len(data) >= ack_start + ACK_SIZE:
+            ack = bytes(data[ack_start : ack_start + ACK_SIZE])
+            if not self._verify_ack(ack, command):
+                logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
+        else:
+            logger.debug(f"[{addr_str}] no ACK received (payload checksum valid)")
+
+        return payload
+
+    def read_serial_data_jkbms_pb(self, command: str) -> bool:
         """
         Send a command and read the response from the BMS.
         Opens a fresh serial port; for callers that already have an open port,
@@ -644,7 +639,7 @@ class Jkbms_pb(Battery):
         addr_str = "0x" + self.address.hex()
         try:
             with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                return self._read_response(ser, command, length)
+                return self._read_response(ser, command)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
