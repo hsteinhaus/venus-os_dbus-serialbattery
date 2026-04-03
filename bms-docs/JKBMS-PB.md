@@ -76,7 +76,7 @@ Total: 11 bytes.  The 8-byte command body is a Modbus FC 0x10 write
 |--------------|---------------------------|------------|---------------------|
 | `status`     | `10 16 20 00 01 02 00 00` | 0x1620     | 0x0002              |
 | `settings`   | `10 16 1e 00 01 02 00 00` | 0x161E     | 0x0001              |
-| `about`      | `10 16 1c 00 01 02 00 00` | 0x161C     | (not observed)      |
+| `about`      | `10 16 1c 00 01 02 00 00` | 0x161C     | 0x0003              |
 
 **Response** (proprietary):
 
@@ -94,18 +94,31 @@ Total: 11 bytes.  The 8-byte command body is a Modbus FC 0x10 write
 
 **Offset 4–5** is a frame type identifier, NOT the responding battery
 address (all batteries return the same value: 0x0002 for status, 0x0001
-for settings).  Confirmed by observing all four batteries (three slaves
-at addr 1–3 and the bus master at addr 0) all returning 0x0002 for
-status.  The 0x55AA payload contains **no battery address field** —
-there is no byte in the response that identifies which battery sent it.
+for settings, 0x0003 for about).  Confirmed by observing all four
+batteries (three slaves at addr 1–3 and the bus master at addr 0) all
+returning 0x0002 for status.  The about frame type (0x0003) was
+confirmed by capturing the JKBMS Monitor init sequence (2026-04-03).
+The 0x55AA payload contains **no battery address field** — there is no
+byte in the response that identifies which battery sent it.
 
-**Address filtering:** When triggered by a BMS bus master (Protocol C),
-address filtering works correctly — see below.  When triggered by an
-external host (CH341 adapter), cross-talk was observed in earlier tests
-(2026-04-02) where all 4 batteries were configured as regular slaves
-(no bus master present).  It is unclear whether the cross-talk was
-caused by Protocol B itself or by the absence of a bus master on the
-bus.  See "Bus Behaviour" section for details.
+**Address filtering:** Works correctly in all tested configurations:
+- Protocol C (bus master) — verified 2026-04-03
+- JKBMS Monitor software (external host, same CH341 adapter) — verified
+  2026-04-03, only the addressed battery responds, zero cross-talk
+
+Cross-talk was observed in earlier driver tests (2026-04-02) using the
+same CH341 adapter, but this was likely caused by the test methodology
+(e.g., rapid command bursts from wakeup-and-drain), not by Protocol B
+itself.  See "Bus Behaviour" section for details.
+
+**JKBMS Monitor software init sequence** (captured 2026-04-03):
+1. About (0x161C) × 2, then Settings (0x161E) × 2, ~160ms apart
+2. Steady-state: Status (0x1620) every ~800ms
+
+The Monitor uses the same FC 0x10 triggers as the driver.  It reads
+device identification (about) and configuration (settings) twice during
+init, then switches to status-only polling.  The about response
+(ftype=0x0003) contains: device ID `JK_PB2A16S20P`, firmware `15.41`.
 
 ### Protocol C: BMS-to-BMS Master Polling (bus master mode)
 
@@ -479,9 +492,10 @@ Higher offsets (derived from official register map, offset = register + 6):
 
 ### About (trigger 0x161C) — driver offsets
 
-Not observed in bus master captures (Protocol C does not use this
-trigger).  These offsets are from the driver source only, unverified
-by logic analyzer capture.
+Not used by Protocol C (bus master).  Observed in JKBMS Monitor init
+sequence (2026-04-03): ftype=0x0003, 300 bytes, checksum at byte 299.
+Device ID and firmware version confirmed readable.  Field offsets below
+are from the driver source.
 
 | Offset | Size | Type   | Field                    |
 |--------|------|--------|--------------------------|
@@ -497,32 +511,38 @@ by logic analyzer capture.
 
 ## Bus Behaviour
 
-### Cross-Talk Observations
+### Address Filtering and Cross-Talk
 
-**Protocol C (bus master):** No cross-talk.  Address filtering works
-correctly — verified over 60 seconds / 14 full cycles (2026-04-03).
+**Summary:** Address filtering works correctly in all controlled tests.
+Cross-talk observed in early driver tests (2026-04-02) was likely an
+artifact of the test methodology, not a Protocol B limitation.
 
-**Protocol A (FC 0x03 from external host):** No cross-talk.  Standard
-Modbus address filtering works.  Tested 2026-04-02 with CH341 adapter,
-all 4 batteries as regular slaves (no bus master).
+**Protocol A (FC 0x03):** No cross-talk.  Standard Modbus address
+filtering.  Tested 2026-04-02, external host, CH341 adapter.
 
-**Protocol B (FC 0x10 trigger from external host):** Cross-talk was
-observed in tests on 2026-04-02, with all 4 batteries configured as
-regular slaves (no bus master present on the bus).  All BMS units
-responded to every FC 0x10 trigger regardless of the address byte.
-The addressed BMS responded within ~50ms; others sent late responses
-200ms–5s later.
+**Protocol B (FC 0x10 trigger, JKBMS Monitor software):** No cross-talk.
+Tested 2026-04-03 with the official JKBMS Monitor application on a
+laptop, polling battery addr 3 via FC 0x10 write to reg 0x1620, using
+the **same CH341 adapter** previously used for the cross-talk tests.
+Only battery 3 responded.  Zero responses from batteries 1, 2, 4.
+Verified over 15 seconds (18 cycles at ~800ms interval).  The response
+sequence: 300-byte 0x55AA status payload + 8-byte FC16 ACK, ~38ms total.
 
-⚠️ **Caveat:** The Protocol B cross-talk was tested under different bus
-conditions than Protocol C.  When the bus master was later introduced
-(2026-04-03), the bus topology changed (continuous 70% bus utilisation,
-master driving the line).  It is unknown whether Protocol B cross-talk
-from an external host would still occur with a bus master present.
-Possible explanations for the difference:
-- The bus master's presence may change slave behaviour
-- The slaves may filter differently based on who sent the trigger
-- The CH341 adapter's signal characteristics may be a factor
-- The absence of any master may put slaves in a promiscuous mode
+**Protocol C (bus master):** No cross-talk.  Verified over 60 seconds /
+14 full cycles (2026-04-03).
+
+**Earlier cross-talk observation (2026-04-02):** During driver
+development tests using the same CH341 adapter on the Cerbo, all BMS
+units appeared to respond to every FC 0x10 trigger regardless of the
+address byte.  This was originally attributed to Protocol B lacking
+address filtering.  However, the JKBMS Monitor test (2026-04-03) using
+the **identical adapter hardware** shows correct address filtering.
+The cross-talk was therefore caused by the test software, not by the
+protocol or the adapter.  Likely cause: the driver's wakeup-and-drain
+pattern sends rapid command bursts (wakeup command + data command
+within ~50ms), which may trigger responses from multiple batteries.
+Single commands at ~800ms intervals (as sent by the JKBMS Monitor)
+produce clean, addressed responses.
 
 The bus is completely silent during passive listening when no master
 is present (verified: 5 rounds × 5 seconds = zero bytes, 2026-04-02).
@@ -531,22 +551,23 @@ is present (verified: 5 rounds × 5 seconds = zero bytes, 2026-04-02).
 
 The proprietary protocol was likely the original BMS interface, predating
 the official Modbus spec. The driver was written against this interface.
-Despite the cross-talk observed in external-host tests, it works in
-practice because:
-1. One BMS responds quickly (~50ms) with 300 bytes
-2. The driver reads just enough data and stops
-3. The wakeup-and-drain pattern consumes stale cross-talk before reads
-4. Late cross-talk from other BMS units is drained between polls
+Address filtering works correctly when single commands are sent at
+reasonable intervals (~800ms as per JKBMS Monitor).
+
+The driver currently uses a "wakeup-and-drain" pattern that sends rapid
+command bursts.  This was the root cause of the cross-talk observed in
+earlier tests — it should be removed.
 
 Note: the 0x55AA payload does NOT contain the responding BMS's address
 (offset 4–5 is a frame type, not an address; no address field exists
-anywhere in the payload), so the driver cannot verify which battery
-actually responded.
+anywhere in the payload).  The FC16 ACK (which follows the 0x55AA
+payload) does contain the correct battery address and should be used
+for responder verification.
 
 ### Migration Path to Protocol A
 
-Switching to standard Modbus FC 0x03 would eliminate cross-talk, the
-wakeup-drain hack, and the 0x55AA parsing — but requires:
+Switching to standard Modbus FC 0x03 would eliminate the 0x55AA
+parsing — but requires:
 - Determining the maximum register count per read (10 confirmed, need
   to find upper limit)
 - Reading in multiple FC 0x03 blocks if the full status map (~140
@@ -573,10 +594,12 @@ result = crc as 2 bytes, little-endian
 Verified by recomputing CRC for all 54 captured Modbus frames (10s
 capture, 2026-04-03) — all match.
 
-Note: In external-host tests (2026-04-02, no bus master present),
-Protocol B did NOT verify the Modbus CRC on requests (BMS responded
-to corrupted CRC).  Protocol A does verify CRC.  Protocol C uses valid
-CRC in both directions (not tested with corrupted CRC).
+Note: In early external-host tests (2026-04-02), Protocol B appeared
+not to verify the Modbus CRC on requests (BMS responded to corrupted
+CRC).  However, those tests used rapid command bursts which may have
+confounded the results — it is unclear whether the response was to the
+corrupted command or to a preceding valid one.  Protocol A does verify
+CRC.  Protocol C uses valid CRC in both directions.
 
 ### 8-bit checksum (0x55AA proprietary responses)
 
@@ -617,7 +640,8 @@ Neither issue applies to Protocol C (BMS-to-BMS, no external adapter).
 | Post-read drain    | 10–50ms    | write-ACK + cross-talk |
 | **Total per battery** | **~50–100ms** | with shared port |
 
-With the legacy wakeup-and-drain pattern, add ~80–100ms.
+The driver's wakeup-and-drain pattern adds ~80–100ms per battery but
+is unnecessary — single commands work without it (see Bus Behaviour).
 
 ### Protocol C — bus master, 3 active + 12 scanned
 

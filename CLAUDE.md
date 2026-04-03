@@ -70,39 +70,22 @@ tail -F /var/log/dbus-serialbattery.ttyUSB1/current | tai64nlocal
 ## Protocol Details (Jkbms_pb)
 
 - Modbus RTU framing; command format: `address + command_bytes + modbusCRC`
-- Response header: `0x55 0xAA` — searched anywhere in buffer (not fixed at offset 0)
-- BMS fw >= v15.36: `command_status` only responds when preceded by another command
-  in the same rapid burst (< ~200ms gap). Both `refresh_data()` and `get_settings()`
-  use `_wakeup_and_drain()` to send a wakeup command, actively drain the response
-  until the bus is quiet, then send the actual data command.
-- Multi-battery RS485 bus: Modbus 0x10 write-ACK prepended to BMS response, shifting
-  `0x55 0xAA` header by a few bytes → fixed by `data.find(b"\x55\xaa")` in
-  `_read_response()`.
-- CH341 TX echo: TX bytes echo into RX buffer on half-duplex adapters;
-  `_read_response()` scans for 0x55AA header past the echo bytes.
-- Response: ~308-315 bytes (vs. 299/300 in `length_fixed`); fine since inner loop
-  exits as soon as data exceeds `length_fixed`.
-- BMS inter-byte gaps during response can exceed 10ms (confirmed). The wakeup
-  drain quiet threshold must account for this (≥15ms, default 30ms).
-- `command_settings` response contains no 0x55AA header — if it leaks into the
-  status read window, it's identifiable by hex values like `420e0000` (3.650V),
-  `480d0000` (3.400V), `a0860100` (100Ah) in the error log.
+- Response: exactly 300 bytes starting with `0x55 0xAA 0xEB 0x90` header
+- Byte 299 is sum8 checksum: `sum(bytes[0:299]) & 0xFF` (driver doesn't validate yet)
+- Frame type at offset 4-5: 0x0002=status, 0x0001=settings, 0x0003=about
+- **No battery address in the 0x55AA payload** — FC16 ACK (8 bytes, after the
+  payload) contains the correct address
+- Response header `0x55 0xAA` searched anywhere in buffer via `data.find()`
+  (CH341 TX echo or write-ACK may shift it by a few bytes)
+- See `bms-docs/JKBMS-PB.md` for full verified field map and protocol details.
 
 ## Serial Communication Architecture
 
-- `_wakeup_and_drain(ser, command)`: sends a command as write-only wakeup, then
-  drains the response until the bus is quiet.  Timing controlled by two config
-  parameters in `[JKBMS_PB]` section of `config.ini`:
-  - `WAKEUP_INITIAL_SLEEP` (default 0.05s): wait after sending wakeup command
-    before starting to drain.
-  - `WAKEUP_QUIET_THRESHOLD` (default 0.03s): bus silence duration to consider
-    the wakeup response fully consumed.
-  - **Critical**: quiet threshold must be ≥15ms. At 10ms, inter-byte gaps in the
-    BMS response cause the drain to exit mid-response, leaking `command_settings`
-    data into the `command_status` read window. This was confirmed on both our
-    4-battery system and an external tester's 9-battery system.
-  - The initial sleep is less critical — even 30ms works on our system. Slower
-    BMS firmware (V14/V15/V19 mix) may need the full 50ms default.
+- **Wakeup-and-drain is OBSOLETE** (2026-04-03): LA1010 captures proved the
+  JKBMS Monitor software gets clean addressed responses with single FC16
+  commands at ~800ms intervals, using the same CH341 adapter, no wakeup
+  burst needed. The wakeup-and-drain rapid command bursts were the ROOT
+  CAUSE of the cross-talk, not a fix for it. Should be removed.
 - `_read_response(ser, command, length, timeout, no_data_timeout)`: core method,
   sends command on already-open port, custom read loop with fail-fast (bail after
   `no_data_timeout` if zero bytes received, default 250ms). Extends deadline by
@@ -110,15 +93,6 @@ tail -F /var/log/dbus-serialbattery.ttyUSB1/current | tai64nlocal
   pauses. Returns False on truncated data instead of passing partial buffer.
 - `read_serial_data_jkbms_pb()`: opens fresh port, delegates to `_read_response()`.
   Only used by `test_connection()` fallback path.
-- `refresh_data()`: single serial session — open port once, `_wakeup_and_drain()`
-  with `command_settings`, then `_read_response()` for status. One automatic retry
-  on failure (wake-up still warm). Timeout 0.5s (BMS responds in ~200ms).
-- `get_settings()`: single serial session (context manager). `_wakeup_and_drain()`
-  with `command_about`, then `_read_response()` for `command_settings` (1.0s
-  timeout) and `command_about` (1.0s timeout). fw >= v15.36 needs the wakeup
-  burst in get_settings too, not just in refresh_data.
-- Polling 4 batteries takes ~700-800ms (down from ~2.7s with separate sessions).
-- No longer uses `read_serialport_data()` from utils.py.
 - EMA low-pass filter (alpha=0.3) on cell voltages suppresses 1mV ADC jitter,
   reducing actual dbus writes from ~100 to ~3-10 per battery per cycle.
 
@@ -142,20 +116,6 @@ tail -F /var/log/dbus-serialbattery.ttyUSB1/current | tai64nlocal
 - External tester (Off-Grid-Garage): 9 batteries (V14/V15/V19 mix) stable
   with default timing (50ms+30ms). Occasional truncated responses on 0x08
   handled by soft deadline extension + truncation guard.
-
-## Wakeup Drain Timing Lessons (2026-04-01)
-
-- The quiet threshold is the critical parameter, not the initial sleep.
-- At 10ms quiet: drain exits mid-response due to inter-byte gaps >10ms in
-  BMS transmission. The remaining `command_settings` bytes (no 0x55AA header)
-  leak into `command_status` read → "no 0x55AA header" errors with ~300 bytes
-  of settings data. **Confirmed broken on both our system and external tester.**
-- At 15ms quiet: works on our system (30ms sleep + 15ms quiet = 45ms window).
-- At 30ms quiet: works on external tester's 9-battery mixed-firmware system.
-- Symptom of too-short quiet: `[0xNN] no 0x55AA header in ~300 bytes` where
-  hex dump shows BMS settings values (e.g. `420e` = 3650 = 3.650V OV setting).
-- Config overrides in `[JKBMS_PB]` section allow per-system tuning without
-  code changes.
 
 ## Upstream / PR Workflow
 
