@@ -486,7 +486,6 @@ class Jkbms_pb(Battery):
         uid = self.unique_identifier_tmp or "0x" + self.address.hex()
         return f"SerialBattery {uid} (JKBMS PB)"
 
-
     def get_balancing(self):
         return 1 if self.balancing else 0
 
@@ -649,6 +648,28 @@ class Jkbms_pb(Battery):
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
+
+    @staticmethod
+    def _verify_checksum(data):
+        """Verify sum8 checksum at byte 299 of a 300-byte 0x55AA response."""
+        if len(data) != 300:
+            return False
+        return sum(data[:299]) & 0xFF == data[299]
+
+    def _verify_ack(self, ack, command):
+        """Verify an 8-byte FC16 write-ACK matches our address and command register."""
+        if len(ack) != 8:
+            return False
+        if ack[0:1] != self.address:
+            return False
+        if ack[1] != 0x10:
+            return False
+        if ack[2:6] != command[1:5]:
+            return False
+        expected_crc = self.modbusCrc(ack[:6])
+        if ack[6:8] != expected_crc:
+            return False
+        return True
 
     def modbusCrc(self, msg: str):
         """
