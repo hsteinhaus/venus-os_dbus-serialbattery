@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import SOC_CALCULATION, get_connection_error_message, logger
+from utils import SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
 from struct import unpack_from
 import serial
 import sys
@@ -30,6 +30,25 @@ class Jkbms_pb(Battery):
     LENGTH_CHECK = 0  # ignored
     LENGTH_POS = 2  # ignored
     LENGTH_SIZE = "H"  # ignored
+
+    _shared_ser = None  # shared serial port, kept open across calls
+
+    # Minimum gap between consecutive commands on the RS485 bus (seconds).
+    # The BMS bus master uses ~180ms; the JKBMS Monitor uses ~800ms.
+    # Too short causes the CH341 adapter to pick up stale bytes from the
+    # previous response.  Configurable via [JKBMS_PB] section in config.ini.
+    try:
+        COMMAND_GAP = get_float_from_config("JKBMS_PB", "COMMAND_GAP", 0.1)
+    except KeyError:
+        COMMAND_GAP = 0.1
+
+    _last_command_time = 0.0
+
+    def _get_ser(self):
+        """Return the shared serial port, opening it if needed."""
+        if Jkbms_pb._shared_ser is None or not Jkbms_pb._shared_ser.is_open:
+            Jkbms_pb._shared_ser = serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1)
+        return Jkbms_pb._shared_ser
 
     def test_connection(self):
         """
@@ -64,14 +83,13 @@ class Jkbms_pb(Battery):
         # Return True if success, False for failure
         addr_str = "0x" + self.address.hex()
         try:
-            ser = serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1)
+            ser = self._get_ser()
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
         status_data = self._read_response(ser, self.command_settings, timeout=1.0)
         if not status_data:
-            ser.close()
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
             return False
 
@@ -203,7 +221,6 @@ class Jkbms_pb(Battery):
         logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
         status_data = self._read_response(ser, self.command_about, timeout=1.0)
-        ser.close()
         # vendor_version start  0: 16 chars
         # hw_version     start 16:  8 chars
         # sw_version     start 24:  8 chars
@@ -281,8 +298,8 @@ class Jkbms_pb(Battery):
         addr_str = "0x" + self.address.hex()
         t0 = time.monotonic()
         try:
-            with serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1) as ser:
-                status_data = self._read_response(ser, self.command_status)
+            ser = self._get_ser()
+            status_data = self._read_response(ser, self.command_status)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
@@ -495,10 +512,17 @@ class Jkbms_pb(Battery):
         ACK_SIZE = 8
         addr_str = "0x" + self.address.hex()
 
+        # Enforce minimum gap between consecutive commands on the bus.
+        elapsed = time.monotonic() - Jkbms_pb._last_command_time
+        if elapsed < self.COMMAND_GAP:
+            time.sleep(self.COMMAND_GAP - elapsed)
+
+        ser.reset_input_buffer()
+
         # Send command
         modbus_msg = self.address + command + self.modbusCrc(self.address + command)
-        ser.reset_input_buffer()
         ser.write(modbus_msg)
+        Jkbms_pb._last_command_time = time.monotonic()
 
         # Read response bytes
         data = bytearray()
@@ -516,7 +540,11 @@ class Jkbms_pb(Battery):
                 if not data:
                     time.sleep(0.01)  # waiting for first byte
                 else:
-                    # Data started but paused — brief wait for ACK
+                    # Data received but buffer empty — check if we have enough
+                    hdr = data.find(b"\x55\xaa")
+                    if hdr >= 0 and len(data) >= hdr + PAYLOAD_SIZE:
+                        break  # have at least the payload, ACK may follow
+                    # Brief wait for more data
                     time.sleep(0.005)
                     if ser.in_waiting == 0:
                         break  # no more data coming
