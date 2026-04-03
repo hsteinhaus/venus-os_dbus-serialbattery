@@ -154,6 +154,10 @@ class MockSerial:
 
 
 class TestReadResponse:
+    def setup_method(self):
+        Jkbms_pb._last_command_time = 0.0
+        Jkbms_pb.COMMAND_GAP = 0  # no gap in tests — MockSerial is instantaneous
+
     def test_clean_response(self):
         """300-byte payload + 0x00 padding + 8-byte ACK."""
         bms = _make_bms(addr=0x03)
