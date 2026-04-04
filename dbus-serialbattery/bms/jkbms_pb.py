@@ -4,7 +4,7 @@
 # Added by https://github.com/KoljaWindeler
 
 from battery import Battery, Cell
-from utils import BATTERY_ADDRESSES, SOC_CALCULATION, get_connection_error_message, get_float_from_config, logger
+from utils import BATTERY_ADDRESSES, SOC_CALCULATION, get_float_from_config, logger
 from struct import unpack_from
 import serial
 import sys
@@ -46,11 +46,23 @@ class Jkbms_pb(Battery):
     _last_command_time = 0.0
     _timing_logged = False
 
+    @property
+    def addr_str(self):
+        return "0x" + self.address.hex()
+
     def _get_ser(self):
         """Return the shared serial port, opening it if needed."""
         if Jkbms_pb._shared_ser is None or not Jkbms_pb._shared_ser.is_open:
             Jkbms_pb._shared_ser = serial.Serial(self.port, baudrate=self.baud_rate, timeout=0.1)
         return Jkbms_pb._shared_ser
+
+    def _read_with_retry(self, ser, command, timeout=0.5):
+        """Send command and read response, retry once on failure."""
+        result = self._read_response(ser, command, timeout)
+        if not result:
+            logger.warning(f"[{self.addr_str}] retry: {command[1:5].hex()}")
+            result = self._read_response(ser, command, timeout)
+        return result
 
     def test_connection(self):
         """
@@ -74,7 +86,7 @@ class Jkbms_pb(Battery):
             logger.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
             result = False
 
-        addr_str = "0x" + self.address.hex()
+        addr_str = self.addr_str
         dt_ms = (time.monotonic() - t0) * 1000
         logger.info(f"[{addr_str}] test_connection: {'OK' if result else 'FAILED'} in {dt_ms:.0f}ms")
         return result
@@ -83,17 +95,14 @@ class Jkbms_pb(Battery):
         # After successful connection get_settings() will be called to set up the battery
         # Set the current limits, populate cell count, etc
         # Return True if success, False for failure
-        addr_str = "0x" + self.address.hex()
+        addr_str = self.addr_str
         try:
             ser = self._get_ser()
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
 
-        status_data = self._read_response(ser, self.command_settings, timeout=1.0)
-        if not status_data:
-            logger.warning(f"[{addr_str}] get_settings: settings retry")
-            status_data = self._read_response(ser, self.command_settings, timeout=1.0)
+        status_data = self._read_with_retry(ser, self.command_settings, timeout=1.0)
         if not status_data:
             logger.warning(f"get_settings: command_settings failed for addr {addr_str}")
             return False
@@ -153,9 +162,8 @@ class Jkbms_pb(Battery):
         # Bit6: Smart Sleep
         SmartSleep = 0x1 & (CtrlBitMask >> 6)
 
-        TMPBatOTA = unpack_from("<b", status_data, 284)[0]  # int 8
-        TMPBatOTAR = unpack_from("<b", status_data, 285)[0]  # int 8
         TIMSmartSleep = unpack_from("<b", status_data, 286)[0]  # uint 8
+        # TMPBatOTA/TMPBatOTAR are the same as TMPStartHeating/TMPStopHeating (offset 284/285)
 
         # balancer enabled
         self.balance_fet = True if BalanEN != 0 else False
@@ -219,16 +227,13 @@ class Jkbms_pb(Battery):
         logger.debug("LCDAlwaysOn: " + str(LCDAlwaysOn))
         logger.debug("SpecialCharger: " + str(SpecialCharger))
         logger.debug("SmartSleep: " + str(SmartSleep))
-        logger.debug("TMPBatOTA: " + str(TMPBatOTA))
-        logger.debug("TMPBatOTAR: " + str(TMPBatOTAR))
+        logger.debug("TMPBatOTA: " + str(TMPStartHeating))
+        logger.debug("TMPBatOTAR: " + str(TMPStopHeating))
         logger.debug("TIMSmartSleep: " + str(TIMSmartSleep))
         logger.debug("TMPStartHeating: " + str(TMPStartHeating))
         logger.debug("TMPStopHeating: " + str(TMPStopHeating))
 
-        status_data = self._read_response(ser, self.command_about, timeout=1.0)
-        if not status_data:
-            logger.warning(f"[{addr_str}] get_settings: about retry")
-            status_data = self._read_response(ser, self.command_about, timeout=1.0)
+        status_data = self._read_with_retry(ser, self.command_about, timeout=1.0)
         # vendor_version start  0: 16 chars
         # hw_version     start 16:  8 chars
         # sw_version     start 24:  8 chars
@@ -311,14 +316,11 @@ class Jkbms_pb(Battery):
         return True
 
     def refresh_data(self):
-        addr_str = "0x" + self.address.hex()
+        addr_str = self.addr_str
         t0 = time.monotonic()
         try:
             ser = self._get_ser()
-            status_data = self._read_response(ser, self.command_status)
-            if not status_data:
-                logger.warning(f"[{addr_str}] refresh_data: retry")
-                status_data = self._read_response(ser, self.command_status)
+            status_data = self._read_with_retry(ser, self.command_status)
         except serial.SerialException as e:
             logger.error(f"[{addr_str}] serial error: {e}")
             return False
@@ -333,15 +335,6 @@ class Jkbms_pb(Battery):
         return result
 
     def read_status_data(self, status_data):
-        # check if connection success
-        if not status_data:
-            logger.warning("read_status_data: command_status failed for addr 0x" + self.address.hex())
-            return False
-
-        #        logger.error("sucess we have data")
-        #        be = ''.join(format(x, ' 02X') for x in status_data)
-        #        logger.error(be)
-
         # cell voltages — EMA low-pass filter to suppress 1mV ADC jitter
         # and reduce dbus write traffic (cache proxy suppresses unchanged values)
         for c in range(self.cell_count):
@@ -418,18 +411,6 @@ class Jkbms_pb(Battery):
                     self.cells[c].balance = True
                 else:
                     self.cells[c].balance = False
-
-        # logging
-        """
-        for c in range(self.cell_count):
-                logger.error("Cell "+str(c)+" voltage: "+str(self.cells[c].voltage)+"V")
-        logger.error("Temperature 2: "+str(temperature_1))
-        logger.error("Temperature 3: "+str(temperature_2))
-        logger.error("voltage: "+str(self.voltage)+"V")
-        logger.error("Current: "+str(self.current))
-        logger.error("SOC: "+str(self.soc)+"%")
-        logger.error("Mos Temperature: "+str(temperature_mos))
-        """
 
         return True
 
@@ -529,7 +510,7 @@ class Jkbms_pb(Battery):
 
     def _send_command(self, ser, command):
         """Enforce bus gap, drain stale bytes, send FC16 command, wait for TX complete."""
-        addr_str = "0x" + self.address.hex()
+        addr_str = self.addr_str
 
         elapsed = time.monotonic() - Jkbms_pb._last_command_time
         if elapsed < self.COMMAND_GAP:
@@ -584,7 +565,7 @@ class Jkbms_pb(Battery):
         """
         PAYLOAD_SIZE = 300
         ACK_SIZE = 8
-        addr_str = "0x" + self.address.hex()
+        addr_str = self.addr_str
 
         if not data:
             logger.warning(f"[{addr_str}] no response")
