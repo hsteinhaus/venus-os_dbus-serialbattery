@@ -520,122 +520,131 @@ class Jkbms_pb(Battery):
         self.protection.high_temperature = 2 if (byte_data & 0x00008000) else 0
         self.protection.low_temperature = 0
 
-    def _read_response(self, ser, command, timeout=0.5):
-        """
-        Send an FC16 command and read the deterministic response.
+    # Expected frame types per command
+    EXPECTED_FTYPE = {
+        b"\x10\x16\x20\x00\x01\x02\x00\x00": 0x0002,  # status
+        b"\x10\x16\x1e\x00\x01\x02\x00\x00": 0x0001,  # settings
+        b"\x10\x16\x1c\x00\x01\x02\x00\x00": 0x0003,  # about
+    }
 
-        Protocol: TX 11 bytes -> RX [echo(0-11)] [payload(300)] [ACK(8)]
-        Returns 300-byte payload from 0x55AA, or False on failure.
-        """
-        PAYLOAD_SIZE = 300
-        ACK_SIZE = 8
+    def _send_command(self, ser, command):
+        """Enforce bus gap, drain stale bytes, send FC16 command, wait for TX complete."""
         addr_str = "0x" + self.address.hex()
 
-        # Enforce minimum gap between consecutive commands on the bus.
         elapsed = time.monotonic() - Jkbms_pb._last_command_time
         if elapsed < self.COMMAND_GAP:
             time.sleep(self.COMMAND_GAP - elapsed)
 
-        # Log pre-send state: how many stale bytes are in the buffer?
         stale = ser.in_waiting
         if stale:
             stale_bytes = ser.read(stale)
             logger.warning(f"[{addr_str}] PRE-SEND stale={stale}: {stale_bytes.hex()}")
         ser.reset_input_buffer()
 
-        # Send command and wait for TX to complete before reading.
-        # The CH341 half-duplex adapter echoes TX→RX; flush() ensures the
-        # 11-byte command is fully transmitted before the BMS responds.
         modbus_msg = self.address + command + self.modbusCrc(self.address + command)
         ser.write(modbus_msg)
         ser.flush()
         Jkbms_pb._last_command_time = time.monotonic()
 
-        # Read response bytes — log every chunk for diagnosis
+    def _receive_data(self, ser, timeout=0.5):
+        """Read bytes from serial port until complete response or timeout.
+
+        Returns raw bytearray (may include TX echo prefix).
+        Complete = 0x55AA header + 310 bytes (payload + pad + ACK + pad).
+        """
+        PAYLOAD_SIZE = 300
+        ACK_SIZE = 8
+        TOTAL_AFTER_HEADER = PAYLOAD_SIZE + 1 + ACK_SIZE + 1  # 310
+
         data = bytearray()
-        chunks = []  # (elapsed_ms, n_bytes) for diagnosis
         start = time.monotonic()
         deadline = start + timeout
         while time.monotonic() < deadline:
             n = ser.in_waiting
             if n > 0:
-                chunk = ser.read(n)
-                data.extend(chunk)
-                chunks.append((round((time.monotonic() - start) * 1000, 1), len(chunk)))
-                # Check if we have a complete response
+                data.extend(ser.read(n))
                 hdr = data.find(b"\x55\xaa")
-                if hdr >= 0 and len(data) >= hdr + PAYLOAD_SIZE + 1 + ACK_SIZE + 1:
+                if hdr >= 0 and len(data) >= hdr + TOTAL_AFTER_HEADER:
                     break
             else:
                 if not data:
-                    time.sleep(0.01)  # waiting for first byte
+                    time.sleep(0.01)
                 else:
-                    time.sleep(0.005)  # brief wait for more data
+                    time.sleep(0.005)
 
-        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+        return data
+
+    def _validate_response(self, data, command):
+        """Validate a raw response and extract the 300-byte payload.
+
+        Checks: 0x55AA header, 0xEB90 marker, frame type, sum8 checksum,
+        padding bytes, FC16 ACK (address + register + CRC), total byte count.
+
+        Returns payload (bytes) or False on any validation failure.
+        """
+        PAYLOAD_SIZE = 300
+        ACK_SIZE = 8
+        addr_str = "0x" + self.address.hex()
 
         if not data:
-            logger.warning(f"[{addr_str}] no response (waited {elapsed_ms}ms)")
+            logger.warning(f"[{addr_str}] no response")
             return False
 
-        # Find 0x55AA header
         hdr = data.find(b"\x55\xaa")
         if hdr < 0:
-            logger.warning(f"[{addr_str}] no 0x55AA in {len(data)} bytes after {elapsed_ms}ms" f" chunks={chunks} data={data[:40].hex()}")
+            logger.warning(f"[{addr_str}] no 0x55AA in {len(data)} bytes: {data[:40].hex()}")
             return False
 
         if len(data) < hdr + PAYLOAD_SIZE:
-            logger.warning(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} after {elapsed_ms}ms" f" hdr@{hdr} chunks={chunks} data={data[:40].hex()}")
+            logger.warning(f"[{addr_str}] truncated: {len(data) - hdr}/{PAYLOAD_SIZE} bytes after 0x55AA")
             return False
 
         payload = bytes(data[hdr : hdr + PAYLOAD_SIZE])
 
-        # 1. Frame marker 0xEB90 at bytes 2-3
         if payload[2:4] != b"\xeb\x90":
             logger.warning(f"[{addr_str}] bad frame marker: {payload[2:4].hex()} (expected eb90)")
             return False
 
-        # 2. Frame type matches command
-        EXPECTED_FTYPE = {
-            b"\x10\x16\x20\x00\x01\x02\x00\x00": 0x0002,  # status
-            b"\x10\x16\x1e\x00\x01\x02\x00\x00": 0x0001,  # settings
-            b"\x10\x16\x1c\x00\x01\x02\x00\x00": 0x0003,  # about
-        }
         ftype = payload[4] | payload[5] << 8
-        expected = EXPECTED_FTYPE.get(command)
+        expected = self.EXPECTED_FTYPE.get(command)
         if expected is not None and ftype != expected:
             logger.warning(f"[{addr_str}] wrong frame type: 0x{ftype:04X} (expected 0x{expected:04X})")
             return False
 
-        # 3. Validate checksum
         if not self._verify_checksum(payload):
             logger.warning(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
             return False
 
-        # 4. Padding bytes must be 0x00
-        pad1_offset = hdr + PAYLOAD_SIZE
-        if pad1_offset < len(data) and data[pad1_offset] != 0x00:
-            logger.warning(f"[{addr_str}] unexpected padding byte after payload: 0x{data[pad1_offset]:02X}")
+        # Padding byte between payload and ACK
+        pad1 = hdr + PAYLOAD_SIZE
+        if pad1 < len(data) and data[pad1] != 0x00:
+            logger.warning(f"[{addr_str}] unexpected padding byte: 0x{data[pad1]:02X}")
 
-        # 5. Validate FC16 ACK
-        ACK_OFFSET = hdr + PAYLOAD_SIZE + 1
-        if len(data) >= ACK_OFFSET + ACK_SIZE:
-            ack = bytes(data[ACK_OFFSET : ACK_OFFSET + ACK_SIZE])
+        # FC16 ACK
+        ack_off = hdr + PAYLOAD_SIZE + 1
+        if len(data) >= ack_off + ACK_SIZE:
+            ack = bytes(data[ack_off : ack_off + ACK_SIZE])
             if not self._verify_ack(ack, command):
                 logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
         else:
-            logger.warning(f"[{addr_str}] no ACK received (payload checksum valid)")
+            logger.warning(f"[{addr_str}] no ACK received")
 
-        # 6. Trailing padding byte after ACK
-        pad2_offset = ACK_OFFSET + ACK_SIZE
-        if pad2_offset < len(data) and data[pad2_offset] != 0x00:
-            logger.warning(f"[{addr_str}] unexpected trailing byte after ACK: 0x{data[pad2_offset]:02X}")
+        # Trailing padding byte after ACK
+        pad2 = ack_off + ACK_SIZE
+        if pad2 < len(data) and data[pad2] != 0x00:
+            logger.warning(f"[{addr_str}] unexpected trailing byte: 0x{data[pad2]:02X}")
 
-        # 7. Total RX byte count check (expect echo(0-11) + 310 = 310-321)
+        # Total byte count (echo 0-11 + 310 = 310-321)
         if len(data) < 310 or len(data) > 321:
             logger.warning(f"[{addr_str}] unexpected total RX: {len(data)} bytes (expected 310-321)")
 
         return payload
+
+    def _read_response(self, ser, command, timeout=0.5):
+        """Send FC16 command and return validated 300-byte payload, or False."""
+        self._send_command(ser, command)
+        data = self._receive_data(ser, timeout)
+        return self._validate_response(data, command)
 
     @staticmethod
     def _verify_checksum(data):
