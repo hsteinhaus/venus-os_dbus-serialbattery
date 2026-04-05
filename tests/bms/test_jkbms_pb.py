@@ -158,6 +158,9 @@ class MockSerial:
     def reset_input_buffer(self):
         self._buf.clear()
 
+    def flush(self):
+        pass
+
 
 class TestReadResponse:
     def setup_method(self):
