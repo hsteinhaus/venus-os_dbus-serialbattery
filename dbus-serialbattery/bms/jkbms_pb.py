@@ -531,11 +531,12 @@ class Jkbms_pb(Battery):
         """Read bytes from serial port until complete response or timeout.
 
         Returns raw bytearray (may include TX echo prefix).
-        Complete = 0x55AA header + 310 bytes (payload + pad + ACK + pad).
+        Minimum complete = 0x55AA header + 308 bytes (payload + ACK, no padding).
+        Some adapters add 0x00 padding (310 bytes total after header).
         """
         PAYLOAD_SIZE = 300
         ACK_SIZE = 8
-        TOTAL_AFTER_HEADER = PAYLOAD_SIZE + 1 + ACK_SIZE + 1  # 310
+        MIN_AFTER_HEADER = PAYLOAD_SIZE + ACK_SIZE  # 308
 
         data = bytearray()
         start = time.monotonic()
@@ -545,7 +546,12 @@ class Jkbms_pb(Battery):
             if n > 0:
                 data.extend(ser.read(n))
                 hdr = data.find(b"\x55\xaa")
-                if hdr >= 0 and len(data) >= hdr + TOTAL_AFTER_HEADER:
+                if hdr >= 0 and len(data) >= hdr + MIN_AFTER_HEADER:
+                    # Got enough; settle briefly for trailing padding bytes
+                    time.sleep(0.005)
+                    n = ser.in_waiting
+                    if n > 0:
+                        data.extend(ser.read(n))
                     break
             else:
                 if not data:
@@ -596,28 +602,18 @@ class Jkbms_pb(Battery):
             logger.warning(f"[{addr_str}] checksum fail: computed={sum(payload[:299]) & 0xFF} stored={payload[299]}")
             return False
 
-        # Padding byte between payload and ACK
-        pad1 = hdr + PAYLOAD_SIZE
-        if pad1 < len(data) and data[pad1] != 0x00:
-            logger.warning(f"[{addr_str}] unexpected padding byte: 0x{data[pad1]:02X}")
-
-        # FC16 ACK
-        ack_off = hdr + PAYLOAD_SIZE + 1
-        if len(data) >= ack_off + ACK_SIZE:
-            ack = bytes(data[ack_off : ack_off + ACK_SIZE])
+        # Scan for FC16 ACK after payload: look for [address][0x10] pattern
+        tail = data[hdr + PAYLOAD_SIZE :]
+        ack_marker = self.address + b"\x10"
+        ack_pos = tail.find(ack_marker)
+        if ack_pos >= 0 and len(tail) >= ack_pos + ACK_SIZE:
+            ack = bytes(tail[ack_pos : ack_pos + ACK_SIZE])
             if not self._verify_ack(ack, command):
                 logger.warning(f"[{addr_str}] ACK validation failed: {ack.hex()}")
+        elif ack_pos >= 0:
+            logger.warning(f"[{addr_str}] ACK truncated: {len(tail) - ack_pos}/{ACK_SIZE} bytes")
         else:
-            logger.warning(f"[{addr_str}] no ACK received")
-
-        # Trailing padding byte after ACK
-        pad2 = ack_off + ACK_SIZE
-        if pad2 < len(data) and data[pad2] != 0x00:
-            logger.warning(f"[{addr_str}] unexpected trailing byte: 0x{data[pad2]:02X}")
-
-        # Total byte count (echo 0-11 + 310 = 310-321)
-        if len(data) < 310 or len(data) > 321:
-            logger.warning(f"[{addr_str}] unexpected total RX: {len(data)} bytes (expected 310-321)")
+            logger.warning(f"[{addr_str}] no ACK found in {len(tail)} trailing bytes")
 
         return payload
 
