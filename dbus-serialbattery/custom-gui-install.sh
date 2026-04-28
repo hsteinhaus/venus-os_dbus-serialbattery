@@ -68,6 +68,30 @@ if [ -d "$pathGuiV1" ]; then
         echo "QML files are not needed."
     else
 
+        # Remove stale overlay files from other packages (e.g. GuiMods) that are
+        # incompatible with the current Venus OS version, to prevent QML load failures.
+        overlay_qml_dir="/data/apps/overlay-fs/data/gui/upper/qml"
+        if [ -d "$overlay_qml_dir" ]; then
+            stale_removed=0
+            for pkg_file in "$overlay_qml_dir"/*.package; do
+                [ -f "$pkg_file" ] || continue
+                pkg=$(cat "$pkg_file")
+                [ "$pkg" = "dbus-serialbattery" ] && continue
+                qml_file="${pkg_file%.package}"
+                rm -f "$qml_file" "${qml_file}.orig" "$pkg_file"
+                stale_removed=$((stale_removed + 1))
+            done
+            if [ $stale_removed -gt 0 ]; then
+                echo "|- Removed $stale_removed stale overlay file(s) from other packages"
+                # Remount the overlay so the kernel's directory cache reflects the removals.
+                # Without a remount, OverlayFS may continue serving deleted files from cache.
+                if mount | grep -q "on $pathGuiV1 type overlay"; then
+                    umount "$pathGuiV1" 2>/dev/null && bash /data/apps/overlay-fs/add-app-and-directory.sh dbus-serialbattery_gui "$pathGuiV1"
+                fi
+                ((filesChanged++))
+            fi
+        fi
+
         # Copy QML files for device screen
         echo "Installing QML files for GUI v1..."
 
@@ -231,6 +255,16 @@ if [ -d "$pathGuiV2" ]; then
                 ((filesChanged++))
             fi
 
+            # copy new Global.qml if present for this version and changed
+            if [ -f "/data/apps/dbus-serialbattery/qml/gui-v2/${sourceQmlDir}/Global.qml" ]; then
+                if ! cmp -s "/data/apps/dbus-serialbattery/qml/gui-v2/${sourceQmlDir}/Global.qml" "/opt/victronenergy/gui-v2/Victron/VenusOS/Global.qml"
+                then
+                    echo "|- Copying Global.qml..."
+                    cp "/data/apps/dbus-serialbattery/qml/gui-v2/${sourceQmlDir}/Global.qml" "/opt/victronenergy/gui-v2/Victron/VenusOS/"
+                    ((filesChanged++))
+                fi
+            fi
+
             # delete old PageBatteryCellVoltages if present
             if [ -f "/data/apps/overlay-fs/data/gui-v2/upper/Victron/VenusOS/pages/settings/devicelist/battery/PageBatteryCellVoltages.qml" ]; then
                 echo "|- Deleting old PageBatteryCellVoltages.qml..."
@@ -339,21 +373,25 @@ elif (( $venusVersionNumber <= $(versionStringToNumber "v3.69") )); then
 elif (( $venusVersionNumber <= $(versionStringToNumber "v3.79") )); then
     # echo "Venus OS $(head -n 1 /opt/victronenergy/version) is part of v3.7x."
     webAssemblyPath="/data/apps/dbus-serialbattery/ext/venus-os_dbus-serialbattery_gui-v2/archive/venus-os_v3.7x"
-    webAssemblyBeta=0
+    webAssemblyBeta=1
+    webAssemblyHashUrl="https://github.com/hsteinhaus/venus-os_gui-v2/releases/download/nightly/venus-gui-v2.wasm.sha256"
+    webAssemblyZipUrl="https://github.com/hsteinhaus/venus-os_gui-v2/releases/download/nightly/venus-webassembly.zip"
     installGuiV2WasmCheck=0
 elif (( $venusVersionNumber <= $(versionStringToNumber "v3.89") )); then
     # echo "Venus OS $(head -n 1 /opt/victronenergy/version) is part of v3.8x."
     webAssemblyPath="/data/apps/dbus-serialbattery/ext/venus-os_dbus-serialbattery_gui-v2/"
     webAssemblyBeta=1
+    webAssemblyHashUrl="https://raw.githubusercontent.com/mr-manuel/venus-os_dbus-serialbattery_gui-v2/refs/heads/master/venus-gui-v2.wasm.sha256"
+    webAssemblyZipUrl="https://raw.githubusercontent.com/mr-manuel/venus-os_dbus-serialbattery_gui-v2/refs/heads/master/venus-webassembly.zip"
     installGuiV2WasmCheck=0
 else
     installGuiV2WasmCheck=1
 fi
 
 
-# Only check for online version, if the Venus OS version matches the v3.8x (current Venus OS beta)
+# Only check for online version, if the Venus OS version has an online source
 if [ $webAssemblyBeta -eq 1 ]; then
-    hash_online=$(curl -s "https://raw.githubusercontent.com/mr-manuel/venus-os_dbus-serialbattery_gui-v2/refs/heads/master/venus-gui-v2.wasm.sha256")
+    hash_online=$(curl -sL "${webAssemblyHashUrl}")
 
     # Check if hash_online contains "venus-gui-v2.wasm", if not the online request failed
     if [[ "$hash_online" == *"venus-gui-v2.wasm"* ]]; then
@@ -367,13 +405,13 @@ if [ $webAssemblyBeta -eq 1 ]; then
                 mkdir -p "${webAssemblyPath}"
             fi
 
-            wget -q -O "${webAssemblyPath}/venus-webassembly.zip" "https://raw.githubusercontent.com/mr-manuel/venus-os_dbus-serialbattery_gui-v2/refs/heads/master/venus-webassembly.zip"
+            wget -q -O "${webAssemblyPath}/venus-webassembly.zip" "${webAssemblyZipUrl}"
 
             # check if download was successful
             if [ $? -ne 0 ]; then
                 echo "ERROR: Download of GUIv2 web version failed."
             else
-                wget -q -O "${webAssemblyPath}/venus-gui-v2.wasm.sha256" "https://raw.githubusercontent.com/mr-manuel/venus-os_dbus-serialbattery_gui-v2/refs/heads/master/venus-gui-v2.wasm.sha256"
+                wget -q -O "${webAssemblyPath}/venus-gui-v2.wasm.sha256" "${webAssemblyHashUrl}"
 
                 # check if download was successful
                 if [ $? -ne 0 ]; then
