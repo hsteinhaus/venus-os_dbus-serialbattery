@@ -8,6 +8,8 @@
 # app=$(dirname $0)/dbus-serialbattery.py
 
 # start -x -s $tty
+export PYTHONDONTWRITEBYTECODE=1
+find /data/apps/dbus-serialbattery -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null
 app="python /data/apps/dbus-serialbattery/dbus-serialbattery.py"
 args="/dev/$tty"
 start $args
