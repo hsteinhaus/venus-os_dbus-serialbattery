@@ -1,0 +1,12 @@
+{
+  "variant": "la1010a1",
+  "channels": [
+    0
+  ],
+  "channel_mask": 1,
+  "sample_rate": 500000,
+  "duration": 15.0,
+  "threshold": 2.0,
+  "timestamp": "2026-04-03T18:49:33Z",
+  "bytes": 937500
+}
