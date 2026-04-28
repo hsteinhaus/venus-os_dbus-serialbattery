@@ -27,6 +27,7 @@
 * Added: JKBMS PB - Multi-battery RS485 fix for fw >= v15.36 with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/425 by @hsteinhaus
 * Added: JKBMS PB - Performance and stability improvements with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/428 by @hsteinhaus
 * Added: JKBMS PB - Dynamic ProductName with battery serial and serial port basename (e.g. `SerialBattery BB02 @ ttyUSB0 (JKBMS PB)`); CustomName left empty by default so user-typed names are preserved as a true override by @hsteinhaus
+* Fixed: GUI clearing of CustomName was silently ignored — `callback_custom_name` returned the new value, which is falsy for the empty string and caused VeDbusService to reject the write while `set_settings` had already persisted it; callback now returns truthy on success by @hsteinhaus
 * Added: aiobmsble library (https://github.com/patman15/aiobmsble), which adds a lot of Bluetooth batteries to Venus OS by @mr-manuel
 * Added: Daren 485 BMS - Read SoH with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/344 by @kopierschnitte
 * Added: dbus caching to reduce writes and therefore CPU consumption with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/397 by @cgoudie
