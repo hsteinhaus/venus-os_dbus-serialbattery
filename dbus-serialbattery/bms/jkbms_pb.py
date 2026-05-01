@@ -6,6 +6,7 @@
 from battery import Battery, Cell
 from utils import BATTERY_ADDRESSES, SOC_CALCULATION, logger
 from struct import unpack_from
+import os
 import serial
 import sys
 import time
@@ -59,6 +60,7 @@ class Jkbms_pb(Battery):
 
     def _recycle_port(self):
         """Force the next _get_ser() to reopen the port (e.g. after USB re-plug)."""
+        self._log_recovery_state()
         logger.warning(f"[{self.addr_str}] recycling serial port after {Jkbms_pb._consecutive_failures} consecutive failures")
         try:
             if Jkbms_pb._shared_ser is not None:
@@ -67,6 +69,36 @@ class Jkbms_pb(Battery):
             pass
         Jkbms_pb._shared_ser = None
         Jkbms_pb._consecutive_failures = 0
+
+    def _log_recovery_state(self):
+        """Snapshot bus + fd state before close so dead-bus episodes are
+        analyzable from the log alone. Each probe is guarded — any
+        instrumentation failure is logged in place but never propagates."""
+        ser = Jkbms_pb._shared_ser
+        bits = []
+
+        try:
+            bits.append(f"in_waiting={ser.in_waiting}")
+        except Exception as e:
+            bits.append(f"in_waiting=err({e!r})")
+
+        try:
+            fd = ser.fileno()
+            link = os.readlink(f"/proc/self/fd/{fd}")
+            fd_rdev = os.fstat(fd).st_rdev
+            path_rdev = os.stat(self.port).st_rdev
+            bits.append(f"fd={fd} link={link} renumbered={'yes' if fd_rdev != path_rdev else 'no'}")
+        except Exception as e:
+            bits.append(f"fd-stat=err({e!r})")
+
+        try:
+            basename = self.port.rsplit("/", 1)[-1]
+            with open(f"/sys/class/tty/{basename}/device/latency_timer") as f:
+                bits.append(f"latency_timer={f.read().strip()}")
+        except Exception as e:
+            bits.append(f"latency_timer=err({e!r})")
+
+        logger.warning(f"[{self.addr_str}] recovery diagnostics: {' '.join(bits)}")
 
     def _read_with_retry(self, ser, command, timeout=0.5):
         """Send command and read response, retry once on failure."""
