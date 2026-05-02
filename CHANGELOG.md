@@ -73,6 +73,7 @@
 * Changed: JKBMS BLE - Fixed negative temperature display. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/369 by @mr-manuel
 * Changed: JKBMS CAN - Correct calculation of arbitration_id for device_address > 0. Fixes https://github.com/mr-manuel/venus-os_dbus-serialbattery/issues/288 with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/306 by @Hooorny
 * Changed: JKBMS PB - Auto-recover the shared RS485 port when the driver gets stuck after a USB re-plug or a persistent dead-bus: after 8 consecutive failed reads the fd is closed and reopened on next access by @hsteinhaus
+* Changed: JKBMS PB - Log bus and fd state (`in_waiting`, fd link, USB renumbering, `latency_timer`) at port-recycle time so the failure is analyzable from the log alone by @hsteinhaus
 * Changed: JKBMS PB: Alarms were not set correctly @mr-manuel
 * Changed: KS48100 BMS - Fixed charge/discharge calculation with https://github.com/mr-manuel/venus-os_dbus-serialbattery/pull/343 by @kopierschnitte
 * Changed: LLT/JBD BLE BMS - Fixed wrong charge/discharge fet assignment @mr-manuel
