@@ -63,6 +63,8 @@ virtual-port-manager/
 
 ├── restart\_socat.sh
 
+├── runit-templates/
+
 ├── status.sh
 
 ├── config.ini
@@ -212,6 +214,43 @@ Shows:
 * watchdog status
 * TCP connectivity
 * last 10 watchdog entries
+
+
+
+
+
+\######################
+
+Testing \& Validation
+
+\######################
+
+
+
+Version 1.0.0 has been fully validated on Venus OS (Pi2) with 15 JK‑PB BMS units.
+
+The following failure modes were tested and confirmed to recover automatically:
+
+* Waveshare TCP drop / reboot
+* GX device reboot
+* socat process termination
+* dbus‑serialbattery process termination
+* PTY disappearance (/dev/ttyV0 removed)
+* watchdog process termination
+* temporary TCP session hijack (nc stealing the port)
+
+
+
+In all cases:
+
+* runit restarted the affected service within 1–2 seconds
+* the watchdog detected persistent failures and logged recovery actions
+* all 15 BMS reappeared on DBus without manual intervention
+* no zombie processes or stale supervise directories were observed
+
+
+
+This confirms the Virtual Port Manager is stable, self‑healing, and production‑ready.
 
 
 

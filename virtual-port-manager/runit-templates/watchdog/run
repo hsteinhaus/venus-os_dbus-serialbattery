@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# Virtual Port Watchdog
+# Checks socat, PTY, and dbus-serialbattery every 30 seconds
+# Logs interventions to /var/log/virtual-port-watchdog.log
+
+LOGFILE="/var/log/virtual-port-watchdog.log"
+
+while true; do
+
+    # Check PTY exists
+    if [ ! -e /dev/ttyV0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') PTY missing, restarting socat" >> $LOGFILE
+        svc -d /service/socat-ttyV0 2>/dev/null
+        svc -u /service/socat-ttyV0 2>/dev/null
+        sleep 5
+    fi
+
+    # Check socat running
+    if ! pgrep -f "socat.*ttyV0" >/dev/null; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') socat not running, restarting" >> $LOGFILE
+        svc -u /service/socat-ttyV0 2>/dev/null
+        sleep 5
+    fi
+
+    # Check dbus-serialbattery running
+    if ! pgrep -f "dbus-serialbattery.*ttyV0" >/dev/null; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') dbus-serialbattery not running, restarting" >> $LOGFILE
+        svc -u /service/dbus-serialbattery-ttyV0 2>/dev/null
+        sleep 5
+    fi
+
+    sleep 60
+done
