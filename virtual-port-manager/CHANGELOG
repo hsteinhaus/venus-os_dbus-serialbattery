@@ -1,0 +1,22 @@
+v1.0.0 — Initial stable release (2026‑05‑08)
+First stable release of the Virtual Port Manager
+- Provides persistent runit services for:
+- socat‑ttyV0 (virtual serial port)
+- dbus‑serialbattery‑ttyV0 (DBus integration)
+- virtual‑port‑watchdog (health monitoring)
+- Includes installer and uninstaller
+- Adds rc.local boot integration
+- Provides status.sh for health checks
+- Supports Waveshare TCP bridge for JK‑PB BMS
+- Fully validated on Raspberry Pi 2 Venus OS build
+
+----------
+
+v1.0.1 — Lifecycle control update (2026‑05‑10)
+- Added enable.sh and disable.sh for clean service lifecycle control
+- enable.sh: recreates /service symlinks and starts runit services
+- disable.sh: stops services via svc -d and removes /service symlinks
+- Ensured predictable start/stop behaviour across all three services
+- Updated README with enable/disable instructions and lifecycle notes
+- Validated clean transitions between enabled/disabled states
+- Confirmed status.sh correctly reflects service state after lifecycle operations
