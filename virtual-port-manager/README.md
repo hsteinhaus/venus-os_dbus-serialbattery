@@ -201,7 +201,7 @@ Status
 
 Check the health of all virtual ports:
 
-* sh status.sh
+sh status.sh
 
 Shows:
 
@@ -214,6 +214,62 @@ Shows:
 * watchdog status
 * TCP connectivity
 * last 10 watchdog entries
+
+
+
+
+
+\######################
+
+Service Lifecycle: Enable / Disable Virtual Port Manager
+
+\######################
+
+The Virtual Port Manager installs three persistent runit services:
+
+* socat-ttyV0 – creates the virtual serial port
+* dbus-serialbattery-ttyV0 – publishes JK‑PB data to DBus
+* virtual-port-watchdog – monitors PTY, socat, and TCP connectivity
+
+These services are defined under:
+
+/data/etc/runit/<service>
+
+and supervised by runit via symlinks under:
+
+/service/<service>
+
+
+
+Disable the Virtual Port Manager
+
+Stops all services cleanly and removes their supervision:
+
+sh /data/apps/virtual-port/disable.sh
+
+This script:
+
+* sends svc -d to stop each service
+* removes the /service symlinks
+* prevents runit from restarting them
+
+After disabling, /dev/ttyV0 disappears and DBus entries are removed.
+
+
+
+Enable the Virtual Port Manager
+
+Recreates supervision and starts all services:
+
+sh /data/apps/virtual-port/enable.sh
+
+This script:
+
+* recreates the /service symlinks
+* triggers runit to spawn new supervise processes
+* starts all services via svc -u
+
+After enabling, /dev/ttyV0 reappears and DBus entries repopulate.
 
 
 
