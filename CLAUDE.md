@@ -112,6 +112,35 @@ Total RX after 0x55AA header: 310 bytes (payload + pad + ACK + pad).
 - Zero stale bytes between commands (all 310 RX bytes consumed)
 - Verified by LA1010: zero cross-talk, all ACKs from correct addresses
 
+## Cold-start fragility on FT2232H (open issue, 2026-06-08)
+
+Restarting `dbus-serialbattery.ttyUSB*` via `svc -t` intermittently
+leaves the first two BMSes (0x01, 0x02) undetected. The probe loop
+gives each address 3 rounds → both fall through before the existing
+8-failure port-recycle kicks in during 0x03; 0x03 and 0x04 then come
+up cleanly. Result: 2/4 batteries → aggregator alarm.
+
+What we have ruled out: bus needing warmup, latency_timer, DTR/RTS
+on the wire, dirty driver exit (added `Jkbms_pb.cleanup()` to drain
+TX + reset buffers on SIGTERM, still reproduces).
+
+What recovers it deterministically:
+```sh
+echo 3-1:1.0 > /sys/bus/usb/drivers/ftdi_sio/unbind
+echo 3-1:1.0 > /sys/bus/usb/drivers/ftdi_sio/bind
+```
+Triggers a fresh USB re-enumeration of iface 0 only (iface 1 / the
+PRO380 meter is unaffected). The tty renumbers; serial-starter spawns
+a fresh `dbus-serialbattery.tty*` and all 4 BMSes detect first try.
+
+Manual workaround when alarm hits: run the unbind/bind pair above
+(adjust `3-1:1.0` to whatever `ls /sys/bus/usb/drivers/ftdi_sio/`
+shows for iface `:1.0`). The tty name will change — that is fine,
+serial-starter sorts it.
+
+Full triage notes and candidate root causes in
+`bms-docs/JKBMS-PB.md` → "FT2232H cold-start fragility".
+
 ## Upstream / PR Workflow
 
 - Upstream repo: `mr-manuel/venus-os_dbus-serialbattery`

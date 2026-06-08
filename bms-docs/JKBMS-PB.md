@@ -692,6 +692,112 @@ Observations:
   that serial-starter will probe and respawn on. Pin the unused channel
   via udev (e.g. `ENV{VE_SERVICE}="ignore"`) to silence the loop.
 
+### FT2232H cold-start fragility (open question)
+
+On the Waveshare FT2232H/HL isolated adapter, restarting the driver
+service (`svc -t`) intermittently leaves the BMS bus silent for the
+first 6–10 read attempts. Symptoms in the log:
+
+```
+WARNING: [0x01] no response
+WARNING: [0x01] retry: 161e0001
+WARNING: [0x01] no response
+INFO:    [0x01] test_connection: FAILED in ~2070ms
+... same for 0x02 ...
+WARNING: [0x03] recovery diagnostics: in_waiting=0 fd=3 link=/dev/ttyUSB* renumbered=no latency_timer=16
+WARNING: [0x03] recycling serial port after 8 consecutive failures
+INFO:    [0x03] test_connection: OK in ~340ms
+INFO:    [0x04] test_connection: OK in ~420ms
+```
+
+The driver only gives each address 3 probe rounds before declaring
+"no battery connection", so by the time the existing 8-failure recycle
+fires the first two addresses (0x01, 0x02) have been permanently
+dropped from the configured `BATTERY_ADDRESSES` list. Addresses 0x03
+and 0x04 then succeed quickly on a freshly-recycled port.
+
+**What we have ruled out so far:**
+
+- *Bus needing warmup.* Standalone probe scripts that simply
+  `open → write FC16 → read 1 s` on the same port returned 0 bytes for
+  the first 3 opens, then 308 bytes from the 4th open onward, with no
+  intervening BMS-state change. Once the chip starts replying it keeps
+  replying — there is no slow analog "settle" period.
+- *Latency timer.* The recovery diagnostics show `latency_timer=16`
+  both before and after the recycle that fixes the bus. Default kernel
+  value is not the trigger.
+- *Modem-control lines (DTR/RTS) on the wire.* RS485 is 2-wire
+  differential; DTR/RTS do not reach the bus. They may still toggle
+  inside the chip on open but the user-visible failure is the same
+  with `dsrdtr=False, rtscts=False` and explicit `ser.rts=False,
+  ser.dtr=False` post-open.
+- *Dirty driver exit.* Adding a SIGTERM hook that drains TX,
+  resets both buffers, and explicitly closes the shared port did
+  **not** prevent the next process from reproducing the failure.
+  (See `Jkbms_pb.cleanup()` and `dbus-serialbattery.py:exit_driver`.)
+
+**What does reliably fix it:** unbinding and rebinding the
+`ftdi_sio` kernel driver from the affected interface. After
+
+```sh
+echo <bus-id>:1.0 > /sys/bus/usb/drivers/ftdi_sio/unbind
+echo <bus-id>:1.0 > /sys/bus/usb/drivers/ftdi_sio/bind
+```
+
+the device re-enumerates with a fresh `/dev/ttyUSB*` name and the next
+process detects all 4 BMSes first try in <500 ms each. The other
+interface (iface 1, the energy meter) is not disturbed by an
+interface-level rebind.
+
+This points at chip- or kernel-driver-level state that pyserial's
+`close()` and a subsequent `open()` do not fully clear, but a kernel
+unbind/bind does. We do not have a confirmed root cause yet.
+
+**Reproduction:**
+
+- Run a probe script that opens `/dev/ttyUSB0`, writes FC16
+  `command_settings` for addr 0x01, polls `in_waiting` for 1 s.
+  Run 3–4 times back-to-back from a cold port; the first 1–3 attempts
+  return 0 bytes, then a later attempt returns 308 bytes (header
+  `55AA EB90 0001` + payload + ACK). Bus state remains "warm"
+  afterwards across `close()`/`open()` cycles for at least 10 s idle.
+
+**Open hypotheses still worth checking:**
+
+1. FT2232H internal TX FIFO holds bytes that pyserial `close()` does
+   not flush. The chip transmits them on the next `open()`, the
+   transceiver may flip direction prematurely, and the next BMS reply
+   collides with that residual TX. Test: log
+   `TIOCOUTQ`/`FIONREAD` at exit time and compare across cycles.
+2. ftdi_sio kernel driver caches per-interface state (latency timer,
+   modem control, baud divisor) that survives a userspace close,
+   but a fresh unbind/bind resets it. Test: read all the FTDI sysfs
+   attributes immediately on `open()` and compare warm vs cold.
+3. The chip's auto-direction logic (set via EEPROM, RS485 mode) needs
+   a `USBDEVFS_RESET` or full vendor reset to re-arm after some
+   number of misordered operations. Test: issue `USBDEVFS_RESET` on
+   the parent USB device before opening, compare to current behaviour.
+
+**Candidate mitigations (ranked):**
+
+1. *Pre-open chip reset.* On driver startup, before any
+   `serial.Serial(...)` open, do an interface-level unbind/bind on the
+   `ftdi_sio` device backing our port. Mark with a marker file to
+   prevent bind loops. The renumbered tty is picked up by
+   serial-starter on the next process spawn; this process exits.
+2. *USBDEVFS_RESET via ioctl on the USB device node.* Same chip
+   reset, in-process, no kernel-driver poking. Same caveat: tty
+   may renumber and the process needs to exit + be respawned.
+3. *Wider failure window in the probe loop.* Increase rounds from
+   3 to e.g. 16 so the existing 8-failure recycle fires *during*
+   0x01 probing rather than during 0x03. Compromise: cold start
+   takes ~20–30 s longer in the worst case, but no chip-level
+   plumbing.
+
+Approach #3 is least intrusive but masks the root cause. #1 or #2
+is the right fix once one of the three open hypotheses above is
+confirmed.
+
 ### FT232R failure signature
 
 Log captures from a 4-BMS Linux rig show two recurring failure patterns
