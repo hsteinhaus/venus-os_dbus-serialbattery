@@ -135,8 +135,19 @@ def main():
 
         # Close the serial connection
         else:
-            # Serial connection is automatically closed when driver exits
-            pass
+            # Let each BMS class drain and close any shared resources it
+            # owns (e.g. the shared RS485 port in jkbms_pb) so the chip is
+            # left in a known state for the next driver session. Implicit
+            # interpreter teardown does not drain TX or reset buffers.
+            for key_address in list(battery.keys()):
+                bat = battery[key_address]
+                if bat is None:
+                    continue
+                if hasattr(bat, "cleanup") and callable(bat.cleanup):
+                    try:
+                        bat.cleanup()
+                    except Exception as e:
+                        logger.warning(f"cleanup error for {key_address}: {e!r}")
 
         logger.info(f"Stopped dbus-serialbattery with exit code {code}")
         sys.exit(code)

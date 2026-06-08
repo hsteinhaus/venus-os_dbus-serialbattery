@@ -70,6 +70,27 @@ class Jkbms_pb(Battery):
         Jkbms_pb._shared_ser = None
         Jkbms_pb._consecutive_failures = 0
 
+    def cleanup(self):
+        """Drain and close the shared RS485 port on process exit so the
+        FT2232H is left in a known state for the next driver session.
+        pyserial's implicit close on interpreter teardown does not drain
+        TX or reset buffers, which has been observed to leave the chip
+        in a state where the first post-restart reads return no data.
+        """
+        ser = Jkbms_pb._shared_ser
+        if ser is None:
+            return
+        try:
+            if ser.is_open:
+                ser.flush()
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                ser.close()
+        except Exception as e:
+            logger.warning(f"[{self.addr_str}] cleanup: {e!r}")
+        finally:
+            Jkbms_pb._shared_ser = None
+
     def _log_recovery_state(self):
         """Snapshot bus + fd state before close so dead-bus episodes are
         analyzable from the log alone. Each probe is guarded — any
