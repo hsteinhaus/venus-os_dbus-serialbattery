@@ -732,9 +732,18 @@ and 0x04 then succeed quickly on a freshly-recycled port.
   with `dsrdtr=False, rtscts=False` and explicit `ser.rts=False,
   ser.dtr=False` post-open.
 - *Dirty driver exit.* Adding a SIGTERM hook that drains TX,
-  resets both buffers, and explicitly closes the shared port did
-  **not** prevent the next process from reproducing the failure.
-  (See `Jkbms_pb.cleanup()` and `dbus-serialbattery.py:exit_driver`.)
+  resets both buffers, and explicitly closes the shared port
+  (`Jkbms_pb.cleanup()` and `dbus-serialbattery.py:exit_driver`)
+  did **not** prevent the failure: a clean-exit → fresh-start
+  cycle reproduced 2/4 once on 2026-06-08. The hook is kept as
+  defensive cleanup but is not the fix.
+
+The failure is **intermittent, not deterministic**. The first
+post-rebind restart on 2026-06-08 succeeded with 4/4; a second
+restart 90 s later failed with 2/4 and then three back-to-back
+restarts after another rebind all succeeded 4/4. We do not yet
+know what state variable flips between "will fail next restart"
+and "will succeed next restart".
 
 **What does reliably fix it:** unbinding and rebinding the
 `ftdi_sio` kernel driver from the affected interface. After
